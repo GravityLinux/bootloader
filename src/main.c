@@ -20,6 +20,7 @@
 #include "payload.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "pmu.h"
 #include "sep.h"
 #include "smp.h"
 #include "string.h"
@@ -161,6 +162,9 @@ void m1n1_main(void)
     wdt_disable();
 #ifndef BRINGUP
     pmgr_init();
+#ifndef RELEASE
+    pmu_reset_panic_counter();
+#endif
 #ifdef USE_DEBUG_USB
     tps6598x_enable_debugusb();
 #endif
