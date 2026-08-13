@@ -94,7 +94,10 @@ bool sptm_handle_xnu_bootstrap(struct exc_info *ctx, u32 endpoint)
         case 9: /* CONFIGURE_SHAREDREGION */
             return sptm_configure_shared_region(ctx);
         case 10: /* NEST_REGION */
-            return sptm_nest_region(ctx, true);
+            if (!sptm_nest_region(ctx, true))
+                return false;
+            sptm_publish_commpage_policy();
+            return true;
         case 11: /* UNNEST_REGION */
             return sptm_nest_region(ctx, false);
         case 13: /* SWITCH_ROOT */
