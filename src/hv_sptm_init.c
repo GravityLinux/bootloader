@@ -1,0 +1,349 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
+#include "hv_sptm_internal.h"
+
+#include "adt.h"
+
+#define SPTM_INIT_MAX_INSTANCES 8
+#define FPAG_PROTECTION_BASE    0x140
+#define FPAG_PROTECTION_STRIDE  0x40
+#define DART_TCR_BYPASS         BIT(1)
+#define DART_TCR_APF_BYPASS     BIT(2)
+#define DART_TCR_REMAP_ENABLE   BIT(7)
+
+struct sptm_init_instances {
+    u64 base[SPTM_INIT_MAX_INSTANCES];
+    u32 count;
+};
+
+struct sptm_init_tunable {
+    u32 offset;
+    u32 size;
+    u64 mask;
+    u64 value;
+} PACKED;
+
+static bool sptm_adt_has(int node, const char *name)
+{
+    return adt_get_property(adt, node, name) != NULL;
+}
+
+static bool sptm_adt_u32_contains(int node, const char *name, u32 wanted)
+{
+    u32 size;
+    const u32 *values = adt_getprop(adt, node, name, &size);
+    if (!values)
+        return false;
+    for (size_t index = 0; index < size / sizeof(*values); index++) {
+        if (values[index] == wanted)
+            return true;
+    }
+    return false;
+}
+
+static bool sptm_dart_mapper_sid(int node, u32 sid)
+{
+    int child = node;
+    ADT_FOREACH_CHILD(adt, child)
+    {
+        if (sptm_adt_u32_contains(child, "reg", sid))
+            return true;
+    }
+    return false;
+}
+
+static bool sptm_dart_remap(int node, u32 sid, u32 *target)
+{
+    u32 size;
+    const u32 *remaps = adt_getprop(adt, node, "remap", &size);
+    if (!remaps)
+        return false;
+    for (size_t index = 0; index < size / sizeof(*remaps); index++) {
+        if ((remaps[index] & 0xff) == sid) {
+            *target = (remaps[index] >> 8) & 0xff;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sptm_dart_instances(int node, int *path, struct sptm_init_instances *trad,
+                                struct sptm_init_instances *fpag, struct sptm_init_instances *fpad)
+{
+    u32 size;
+    const char *instances = adt_getprop(adt, node, "instance", &size);
+    for (size_t index = 0; instances && index < size / 16; index++) {
+        struct sptm_init_instances *kind = NULL;
+        const char *tag = instances + index * 16;
+        if (!memcmp(tag, "TRAD", 4))
+            kind = trad;
+        else if (!memcmp(tag, "FPAG", 4))
+            kind = fpag;
+        else if (!memcmp(tag, "FPAD", 4))
+            kind = fpad;
+        if (!kind)
+            continue;
+
+        assert(kind->count < ARRAY_SIZE(kind->base));
+        adt_get_reg(adt, path, "reg", index, &kind->base[kind->count++], NULL);
+    }
+}
+
+static void sptm_dart_sid_states(int node, const char *name, struct sptm_dart *dart)
+{
+    u64 global_dva_size = sptm_adt_integer(node, "vm-size", 0);
+    bool dynamic = sptm_adt_integer(node, "dart-options", 0) & 0x10;
+
+    for (u32 sid = 0; sid < dart->sid_count; sid++) {
+        struct sptm_dart_sid *state = &dart->sid_states[sid];
+        char property[32];
+        state->root_level = 1;
+
+        snprintf(property, sizeof(property), "pt-region-%u", sid);
+        u32 pt_size;
+        const u64 *pt_region = adt_getprop(adt, node, property, &pt_size);
+        bool translating = sptm_adt_u32_contains(node, "sid", sid) ||
+                           sptm_dart_mapper_sid(node, sid) || (dynamic && sid) || pt_region;
+        if (translating) {
+            // Address spaces larger than 64 GiB start their walk at level 0.
+            snprintf(property, sizeof(property), "vm-size-%u", sid);
+            state->root_level = sptm_adt_integer(node, property, global_dva_size) > BIT(36) ? 0 : 1;
+        }
+
+        u32 remap;
+        if (sptm_dart_remap(node, sid, &remap)) {
+            state->flags = SPTM_DART_SID_KNOWN | SPTM_DART_SID_POLICY;
+            state->tcr = DART_TCR_REMAP_ENABLE | remap << 8;
+        } else {
+            snprintf(property, sizeof(property), "bypass-%u", sid);
+            bool bypass = sptm_adt_has(node, property);
+            snprintf(property, sizeof(property), "apf-bypass-%u", sid);
+            bool apf_bypass = sptm_adt_has(node, property);
+            if (bypass || apf_bypass) {
+                state->flags = SPTM_DART_SID_KNOWN | SPTM_DART_SID_ENABLED | SPTM_DART_SID_POLICY;
+                state->tcr =
+                    (bypass ? DART_TCR_BYPASS : 0) | (apf_bypass ? DART_TCR_APF_BYPASS : 0);
+            } else if (translating) {
+                state->flags = SPTM_DART_SID_KNOWN;
+                state->tcr = DART_TCR_TRANSLATE | (state->root_level ? 0 : BIT(3));
+                if (pt_region && pt_size >= 2 * sizeof(u64)) {
+                    state->pt_start = pt_region[0];
+                    state->pt_end = pt_region[1];
+                    snprintf(property, sizeof(property), "l2-tt-%u", sid);
+                    state->root = sptm_adt_integer(node, property, state->pt_start);
+                    if (!cpu_features->apple_sysregs_unlocked && !strcmp(name, "dart-pmp") &&
+                        !sid)
+                        state->flags |= SPTM_DART_SID_ENABLED;
+                }
+            }
+        }
+
+        if (sptm_adt_u32_contains(node, "exclave-sid", sid)) {
+            state->root = 0;
+            state->pt_start = 0;
+            state->pt_end = 0;
+            state->tcr = 0;
+            state->root_level = 1;
+            state->flags = SPTM_DART_SID_KNOWN | SPTM_DART_SID_ENABLED | SPTM_DART_SID_EXCLAVE;
+        }
+
+        // Firmware page tables bypass RETYPE, so retire their WB aliases here.
+        for (u64 page = state->pt_start; page < state->pt_end; page += SPTM_PAGE_SIZE) {
+            u64 host_page = page;
+            mmu_map_ram_pages_nc(&host_page, 1, true);
+        }
+        if (state->flags & SPTM_DART_SID_ENABLED)
+            dart->boot_streams[sid / 32] |= BIT(sid % 32);
+    }
+}
+
+static u32 sptm_dart_tunables(int node, const struct sptm_init_instances *trad,
+                              struct sptm_dart_tunable *output)
+{
+    u32 count = 0;
+    for (u32 instance = 0; instance < trad->count; instance++) {
+        char property[40];
+        snprintf(property, sizeof(property), "dart-tunables-instance-%u", instance);
+        u32 size;
+        const struct sptm_init_tunable *tunables = adt_getprop(adt, node, property, &size);
+        for (size_t index = 0; tunables && index < size / sizeof(*tunables); index++) {
+            assert(count < SPTM_MAX_DART_TUNABLES);
+            output[count].base = trad->base[instance];
+            output[count].offset = tunables[index].offset;
+            output[count].size = tunables[index].size;
+            output[count].mask = tunables[index].mask;
+            output[count].value = tunables[index].value;
+            count++;
+        }
+    }
+    return count;
+}
+
+static u32 sptm_dart_dapf(int node, const struct sptm_init_instances *fpad,
+                          struct sptm_dart_dapf *output)
+{
+    u32 count = 0;
+    for (u32 instance = 0; instance < fpad->count; instance++) {
+        char property[32];
+        snprintf(property, sizeof(property), "dapf-instance-%u", instance);
+        u32 size;
+        const u8 *entries = adt_getprop(adt, node, property, &size);
+        if (!entries)
+            continue;
+        size_t stride = size % 52 == 0 ? 52 : (size % 56 == 0 ? 56 : 55);
+        for (size_t index = 0; index < size / stride; index++) {
+            const u8 *entry = entries + index * stride;
+            struct sptm_dart_dapf *dapf = &output[count++];
+            assert(count <= SPTM_MAX_DART_DAPF);
+            dapf->base = fpad->base[instance] + index * 0x40;
+            memcpy(&dapf->start, entry, sizeof(dapf->start));
+            memcpy(&dapf->end, entry + 8, sizeof(dapf->end));
+            memcpy(&dapf->r20, entry + 16, sizeof(dapf->r20));
+            memcpy(&dapf->r4, entry + 24, sizeof(dapf->r4));
+            dapf->control = entry[49] << 4 | entry[50];
+        }
+    }
+    return count;
+}
+
+static u32 sptm_dart_clocks(int node, const struct sptm_init_instances *trad,
+                            const struct sptm_init_instances *fpag, u64 *output)
+{
+    u32 size;
+    const u32 *slices = adt_getprop(adt, node, "clock-protection-slice-index", &size);
+    if (!slices)
+        return 0;
+    u32 count = min(size / sizeof(*slices), fpag->count * trad->count);
+    assert(count <= SPTM_MAX_DART_CLOCKS);
+    for (u32 index = 0; index < count; index++) {
+        u32 fpag_index = index / trad->count;
+        output[index] = fpag->base[fpag_index] + FPAG_PROTECTION_BASE +
+                        (slices[index] - 1) * FPAG_PROTECTION_STRIDE;
+    }
+    return count;
+}
+
+static u32 sptm_dart_flags(int node)
+{
+    return (sptm_adt_has(node, "retention") ? SPTM_DART_RETENTION : 0) |
+           (sptm_adt_has(node, "ignore-secondary") ? SPTM_DART_IGNORE_SECONDARY : 0) |
+           (sptm_adt_has(node, "dart-ungang-shared-ps") ? SPTM_DART_UNGANG_SHARED_PS : 0);
+}
+
+static void sptm_init_darts(struct sptm_allocator *allocator)
+{
+    int path[8];
+    int arm_io = adt_path_offset_trace(adt, "/arm-io", path);
+    size_t depth = 0;
+    while (path[depth])
+        depth++;
+
+    int node = arm_io;
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        if (!adt_is_compatible(adt, node, "dart,t8110") || !sptm_adt_has(node, "dart-id"))
+            continue;
+
+        path[depth] = node;
+        path[depth + 1] = 0;
+        struct sptm_init_instances trad = {0}, fpag = {0}, fpad = {0};
+        sptm_dart_instances(node, path, &trad, &fpag, &fpad);
+        if (!trad.count || trad.count > SPTM_MAX_DART_INSTANCES)
+            continue;
+
+        const char *name = adt_get_name(adt, node);
+        u32 sid_count = sptm_adt_integer(node, "sid-count", 16);
+        if (sptm.dart_count >= ARRAY_SIZE(sptm.darts) || sid_count > SPTM_MAX_DART_SIDS) {
+            printf("HV: SPTM cannot track %s\n", name);
+            continue;
+        }
+
+        struct sptm_dart *dart = &sptm.darts[sptm.dart_count++];
+        struct sptm_dart_dapf *dapf = sptm_alloc(allocator, SPTM_MAX_DART_DAPF * sizeof(*dapf), 16);
+        struct sptm_dart_tunable *tunables =
+            sptm_alloc(allocator, SPTM_MAX_DART_TUNABLES * sizeof(*tunables), 16);
+        u64 *clocks = sptm_alloc(allocator, SPTM_MAX_DART_CLOCKS * sizeof(*clocks), 16);
+        dart->id = sptm_adt_integer(node, "dart-id", 0);
+        dart->sid_count = sid_count;
+        dart->instance_count = trad.count;
+        memcpy(dart->instances, trad.base, sizeof(dart->instances));
+        dart->flags = sptm_dart_flags(node);
+        dart->dapf_entries = dapf;
+        dart->dapf_count = sptm_dart_dapf(node, &fpad, dapf);
+        dart->clock_entries = clocks;
+        dart->clock_count = sptm_dart_clocks(node, &trad, &fpag, clocks);
+        dart->tunable_entries = tunables;
+        dart->tunable_count = sptm_dart_tunables(node, &trad, tunables);
+        dart->sid_states = sptm_alloc_zero(allocator, sid_count * sizeof(*dart->sid_states), 16);
+        sptm_dart_sid_states(node, name, dart);
+    }
+}
+
+static void sptm_init_sart(void)
+{
+    int path[8];
+    int node = adt_path_offset_trace(adt, "/arm-io/sart-ans", path);
+    u64 base, canary_base = 0;
+    adt_get_reg(adt, path, "reg", 0, &base, NULL);
+    adt_get_reg(adt, path, "reg", 1, &canary_base, NULL);
+    sptm.sart_base = base;
+    sptm.sart_canary = canary_base + sptm_adt_integer(node, "power-canary-offset", 0);
+    sptm.sart_exclusive_bounds = sptm_adt_has(node, "exclusive-bounds");
+    // Entries already live at handoff belong to firmware.
+    for (u32 index = 0; index < SPTM_SART_ENTRIES; index++) {
+        if (read32(base + index * sizeof(u32)) & 0xff)
+            sptm.sart_protected_mask |= BIT(index);
+    }
+}
+
+static void sptm_init_nvme(struct sptm_allocator *allocator)
+{
+    int ans_path[8];
+    int ans = adt_path_offset_trace(adt, "/arm-io/ans", ans_path);
+    int defaults = adt_path_offset(adt, "/defaults");
+    u64 main_bar, queue_bar;
+    adt_get_reg(adt, ans_path, "reg", 3, &main_bar, NULL);
+    if (sptm_adt_has(ans, "nvme-secure-reg-layout")) {
+        queue_bar = main_bar + 0x4000;
+    } else if (sptm_adt_has(defaults, "nvme-iboot-sptm-security") &&
+               sptm_adt_has(ans, "nvme-secure-bar")) {
+        adt_get_reg(adt, ans_path, "reg", 9, &queue_bar, NULL);
+    } else {
+        queue_bar = main_bar;
+    }
+
+    struct sptm_nvme *nvme = &sptm.nvme;
+    nvme->queue_entries = sptm_adt_integer(ans, "nvme-queue-entries", 64);
+    nvme->tl_wa = sptm_adt_has(ans, "nvme-tl-wa");
+    nvme->tl_slots = sptm_adt_integer(ans, "nvme-num-sl", 0);
+
+    u64 tcb_bytes = ALIGN_UP(nvme->queue_entries * SPTM_NVME_TCB_SIZE, SPTM_NVME_TCB_ALIGNMENT);
+    u64 prp_bytes = ALIGN_UP(nvme->queue_entries * SPTM_NVME_PRP_SLOT_SIZE, SPTM_PAGE_SIZE);
+    nvme->admin_tcbs = (u64)sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
+    nvme->io_tcbs = (u64)sptm_alloc_zero(allocator, tcb_bytes, SPTM_PAGE_SIZE);
+    nvme->prp_scratch = (u64)sptm_alloc_zero(allocator, prp_bytes, SPTM_PAGE_SIZE);
+    nvme->command_state =
+        (u64)sptm_alloc_zero(allocator, nvme->queue_entries * sizeof(struct sptm_nvme_command), 16);
+
+    nvme->queue_bar = queue_bar;
+    nvme->nvmmu = main_bar + 0x28000;
+    nvme->prp_flush_wa = sptm_adt_has(ans, "nvme-prp-flush-wa");
+    nvme->vdma_wa = sptm_adt_has(ans, "nvme-vdma-wa");
+    if (nvme->tl_wa) {
+        adt_get_reg(adt, ans_path, "reg", 10, &nvme->tl_mask, NULL);
+        adt_get_reg(adt, ans_path, "reg", 11, &nvme->tl_control, NULL);
+        adt_get_reg(adt, ans_path, "reg", 12, &nvme->tl_status, NULL);
+    }
+    if (nvme->vdma_wa)
+        adt_get_reg(adt, ans_path, "reg", 13, &nvme->vdma_status, NULL);
+    if (sptm_adt_has(ans, "nvme-ans-sha-present"))
+        adt_get_reg(adt, ans_path, "reg", 14, &nvme->sha_base, NULL);
+}
+
+// The caller has already switched adt to the guest device tree.
+void sptm_init_platform(struct sptm_allocator *allocator)
+{
+    sptm_init_sart();
+    sptm_init_nvme(allocator);
+    sptm_init_darts(allocator);
+}
