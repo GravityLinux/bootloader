@@ -13,6 +13,8 @@ parser.add_argument('-r', '--raw', action="store_true", help="Raw mode is the de
 parser.add_argument('--macho', action="store_true", help="Image is Mach-O instead of raw")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainloading XNU")
+parser.add_argument('--verbose', action="store_true",
+                    help="Show individual Mach-O segment entries")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -33,7 +35,7 @@ if not args.macho:
     entry = new_base + args.entry_point
 else:
     macho = MachO(args.payload.read_bytes())
-    image = macho.prepare_image()
+    image = macho.prepare_image(verbose=args.verbose)
     image += b"\x00\x00\x00\x00"
     entry = macho.entry
     entry -= macho.vmin
