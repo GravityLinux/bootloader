@@ -638,6 +638,7 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     sptm.kernel_root = context.ttbr1_pa;
     sptm.max_cpus = cpu_count;
     sptm.frame_table_pa = context.frame_table_pa;
+    sptm.panic_state_pa = context.panic_state_pa;
     sptm.txm_info_va = context.txm_info_va;
     sptm.enabled = true;
 
