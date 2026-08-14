@@ -303,6 +303,7 @@ struct sptm_state {
     u64 physmap_end;
     u64 scratch_pa;
     u64 kernel_root;
+    u64 panic_state_pa;
     u64 frame_table_pa;
     u64 uat_global_state;
     u64 uat_gpu_contexts;
