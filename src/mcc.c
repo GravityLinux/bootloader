@@ -535,8 +535,13 @@ int mcc_init_t8140(int node, int *path)
     if (!plane_count) {
         u32 plane_mask = 0;
 
-        if (ADT_GETPROP(adt, node, "amcc-plane-enable-mask", &plane_mask) > 0)
-            plane_count = __builtin_popcount(plane_mask);
+        if (ADT_GETPROP(adt, node, "amcc-plane-enable-mask", &plane_mask) > 0) {
+            /* Avoid a libgcc popcount helper with -mgeneral-regs-only. */
+            while (plane_mask) {
+                plane_count++;
+                plane_mask &= plane_mask - 1;
+            }
+        }
     }
     if (!plane_count)
         plane_count = 4;
