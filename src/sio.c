@@ -2,6 +2,7 @@
 
 #include "adt.h"
 #include "errno.h"
+#include "firmware.h"
 #include "malloc.h"
 #include "sio.h"
 #include "types.h"
@@ -72,12 +73,24 @@ static void *add_fwdata(struct sio_data *siodata, size_t size, u32 param_id)
     return p;
 }
 
+static int add_fwparam(struct sio_data *siodata, u32 key, u32 value)
+{
+    if (siodata->num_fwparams >= MAX_FWPARAMS)
+        return -1;
+
+    struct sio_fwparam *param = &siodata->fwparams[siodata->num_fwparams++];
+    param->key = key;
+    param->value = value;
+    return 0;
+}
+
 #define PARAM_UNK_000b     0x000b
 #define PARAM_PANIC_BUFFER 0x000f
 #define PARAM_MAP_RANGE    0x001a
 #define PARAM_DEVICE_TYPE  0x001c
 #define PARAM_TUNABLES     0x001e
 #define PARAM_DMASHIM_DATA 0x0022
+#define PARAM_UNK_002a     0x002a
 #define PARAM_UNK_030d     0x030d
 
 struct copy_rule {
@@ -85,13 +98,16 @@ struct copy_rule {
     int fw_param;
     bool keyed;
     int blobsize;
-    u32 nkeys;
+    bool scalar;
+    u32 value; /* Scalar value, or the appended word in an expanded keyed record. */
+    u32 output_blobsize; /* Zero preserves the ADT payload size. */
+    u32 extra_slots;
     const char *keys[9];
 };
 
 #define SPACER "\xff\xff\xff\xff"
 
-struct copy_rule copy_rules[] = {
+static const struct copy_rule copy_rules[] = {
     {
         .prop = "asio-ascwrap-tunables",
         .fw_param = PARAM_TUNABLES,
@@ -133,7 +149,58 @@ struct copy_rule copy_rules[] = {
     },
 };
 
-int find_key_index(const char *keylist[], u32 needle)
+static const struct copy_rule copy_rules_26_6_2[] = {
+    {
+        .prop = "asio-ascwrap-tunables",
+        .fw_param = PARAM_TUNABLES,
+    },
+    {
+        .fw_param = PARAM_UNK_002a,
+        .scalar = true,
+        .value = 0,
+    },
+    {
+        .blobsize = 0x1cc0,
+        .fw_param = PARAM_UNK_000b,
+    },
+    {
+        .blobsize = 0x1e000,
+        .fw_param = PARAM_PANIC_BUFFER,
+    },
+    {
+        // performance endpoint? FIFO?
+        .blobsize = 0x4000,
+        .fw_param = PARAM_UNK_030d,
+    },
+    {
+        .prop = "map-range",
+        .fw_param = PARAM_MAP_RANGE,
+        .blobsize = 16,
+        .keyed = true,
+        .keys = {SPACER, SPACER, SPACER, "MISC", NULL},
+    },
+    {
+        .prop = "dmashim",
+        .fw_param = PARAM_DMASHIM_DATA,
+        .blobsize = 32,
+        .output_blobsize = 36,
+        .extra_slots = 1,
+        .value = 0xffffffff,
+        .keyed = true,
+        .keys = {"SSPI", "SUAR", "SAUD", "ADMA", "AAUD", NULL},
+    },
+    {
+        // it seems 'device_type' must go after 'dmashim'
+        .prop = "device-type",
+        .fw_param = PARAM_DEVICE_TYPE,
+        .blobsize = 8,
+        .extra_slots = 1,
+        .keyed = true,
+        .keys = {"dSPI", "dUAR", "dMCA", "dDPA", "dPDM", "dALE", "dAMC", "dAPD", NULL},
+    },
+};
+
+int find_key_index(const char *const keylist[], u32 needle)
 {
     int i;
     for (i = 0; keylist[i]; i++) {
@@ -160,14 +227,26 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
         goto err;
     }
 
-    for (int i = 0; i < (int)ARRAY_SIZE(copy_rules); i++) {
-        struct copy_rule *rule = &copy_rules[i];
+    const struct copy_rule *rules =
+        os_firmware.version == V26_6_2 ? copy_rules_26_6_2 : copy_rules;
+    size_t nrules = os_firmware.version == V26_6_2 ? ARRAY_SIZE(copy_rules_26_6_2)
+                                                  : ARRAY_SIZE(copy_rules);
+
+    for (size_t i = 0; i < nrules; i++) {
+        const struct copy_rule *rule = &rules[i];
+        size_t input_blobsize = rule->blobsize;
+        size_t output_blobsize = rule->output_blobsize ?: input_blobsize;
         u32 len;
+
+        if (rule->scalar) {
+            if (add_fwparam(siodata, rule->fw_param, rule->value))
+                goto err;
+            continue;
+        }
 
         if (!rule->prop) {
             if (!add_fwdata(siodata, rule->blobsize, rule->fw_param))
                 goto err;
-
             continue;
         }
 
@@ -182,21 +261,26 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
             if (!sio_blob)
                 goto err;
             memcpy8(sio_blob, (void *)adt_blob, len);
+
             continue;
         }
 
         int nkeys = find_key_index(rule->keys, 0);
-        u8 *sio_blob = add_fwdata(siodata, nkeys * rule->blobsize, rule->fw_param);
+
+        size_t output_slots = nkeys + rule->extra_slots;
+
+        u8 *sio_blob =
+            add_fwdata(siodata, output_slots * output_blobsize, rule->fw_param);
         if (!sio_blob)
             goto err;
 
-        if (len % (rule->blobsize + 4) != 0) {
+        if (len % (input_blobsize + 4) != 0) {
             printf("%s: bad length %d of ADT property '%s', expected multiple of %d + 4\n",
-                   __func__, len, rule->prop, rule->blobsize);
+                   __func__, len, rule->prop, (int)input_blobsize);
             goto err;
         }
 
-        for (u32 off = 0; off + rule->blobsize <= len; off += (rule->blobsize + 4)) {
+        for (u32 off = 0; off + input_blobsize <= len; off += (input_blobsize + 4)) {
             const u8 *p = &adt_blob[off];
             u32 key = *((u32 *)p);
             int key_idx = find_key_index(rule->keys, key);
@@ -207,7 +291,10 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
                 goto err;
             }
 
-            memcpy8(sio_blob + (key_idx * rule->blobsize), (void *)(p + 4), rule->blobsize);
+            u8 *slot = sio_blob + (key_idx * output_blobsize);
+            memcpy8(slot, (void *)(p + 4), input_blobsize);
+            if (output_blobsize != input_blobsize)
+                *(u32 *)(slot + input_blobsize) = rule->value;
         }
     }
 
