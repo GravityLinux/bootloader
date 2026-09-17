@@ -490,8 +490,151 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
     return 0;
 }
 
+static int dt_set_gpu_t8132_adt(void *dt, int gpu, int sgx)
+{
+    ADT_FOREACH_PROPERTY(adt, sgx, prop)
+    {
+        char name[64];
+        size_t len = strnlen(prop->name, sizeof(prop->name));
+        if (len == sizeof(prop->name))
+            bail("ADT: GPU: unterminated property name\n");
+        snprintf(name, sizeof(name), "apple,sgx-%s", prop->name);
+        if (fdt_setprop(dt, gpu, name, prop->value, prop->size & 0x7fffffff))
+            bail("FDT: GPU: failed to preserve %s\n", prop->name);
+    }
+
+    int arm_io = adt_path_offset(adt, "/arm-io");
+    u32 revision;
+    if (arm_io < 0 || ADT_GETPROP(adt, arm_io, "chip-revision", &revision) < 0)
+        bail("ADT: GPU: missing chip revision\n");
+    if (fdt_setprop_u32(dt, gpu, "apple,chip-revision", revision) ||
+        fdt_setprop_string(dt, gpu, "apple,firmware-build", os_firmware.iboot))
+        return -1;
+    return 0;
+}
+
+static int dt_set_gpu_t8132_perf(void *dt, int gpu, int sgx)
+{
+    u32 count, tables, core_len, sram_len;
+    if (ADT_GETPROP(adt, sgx, "perf-state-count", &count) < 0 ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) < 0 ||
+        tables != 1 || count == 0 || count > MAX_PSTATES)
+        bail("ADT: GPU: unsupported M4 performance table geometry\n");
+    const struct perf_state *core = adt_getprop(adt, sgx, "perf-states", &core_len);
+    const struct perf_state *sram = adt_getprop(adt, sgx, "perf-states-sram", &sram_len);
+    if (!core || !sram || core_len != count * sizeof(*core) || sram_len != core_len)
+        bail("ADT: GPU: incomplete M4 performance tables\n");
+
+    fdt32_t freq_a[MAX_PSTATES], freq_b[MAX_PSTATES];
+    fdt32_t index_a[MAX_PSTATES], index_b[MAX_PSTATES];
+    fdt32_t core_voltage[MAX_PSTATES], memory_voltage[MAX_PSTATES];
+    u32 groups = 0;
+    for (u32 first = 0; first < count;) {
+        u32 last = first, low = first, high = first;
+        while (last + 1 < count && core[last + 1].volt == core[first].volt)
+            last++;
+        for (u32 row = first; row <= last; row++) {
+            if (core[row].freq != sram[row].freq ||
+                sram[row].volt != sram[first].volt || core[row].freq % 1000000)
+                bail("ADT: GPU: inconsistent M4 performance row %u\n", row);
+            if (core[row].freq < core[low].freq)
+                low = row;
+            if (core[row].freq > core[high].freq)
+                high = row;
+        }
+        if (first && core[first].volt <= core[first - 1].volt)
+            bail("ADT: GPU: unordered M4 voltage steps\n");
+        freq_a[groups] = cpu_to_fdt32(core[high].freq / 1000000);
+        freq_b[groups] = cpu_to_fdt32(core[low].freq / 1000000);
+        index_a[groups] = cpu_to_fdt32(high);
+        index_b[groups] = cpu_to_fdt32(low);
+        core_voltage[groups] = cpu_to_fdt32(core[first].volt);
+        memory_voltage[groups] = cpu_to_fdt32(sram[first].volt);
+        groups++;
+        first = last + 1;
+    }
+    if (groups != 11)
+        bail("ADT: GPU: expected eleven M4 voltage steps, found %u\n", groups);
+
+    static const u32 pwr_calib_a[] = {0, 8, 14, 21, 27, 36, 44, 54, 60, 79, 100};
+    static const u32 pwr_calib_b[] = {0, 0, 0, 0, 16, 33, 47, 61, 69, 86, 100};
+    fdt32_t rel_a[11], rel_b[11];
+    for (u32 i = 0; i < groups; i++) {
+        rel_a[i] = cpu_to_fdt32(pwr_calib_a[i]);
+        rel_b[i] = cpu_to_fdt32(pwr_calib_b[i]);
+    }
+    size_t size = groups * sizeof(fdt32_t);
+    if (fdt_setprop(dt, gpu, "apple,m4-freq-a", freq_a, size) ||
+        fdt_setprop(dt, gpu, "apple,m4-freq-b", freq_b, size) ||
+        fdt_setprop(dt, gpu, "apple,m4-index-a", index_a, size) ||
+        fdt_setprop(dt, gpu, "apple,m4-index-b", index_b, size) ||
+        fdt_setprop(dt, gpu, "apple,m4-core-voltage", core_voltage, size) ||
+        fdt_setprop(dt, gpu, "apple,m4-memory-voltage", memory_voltage, size) ||
+        fdt_setprop(dt, gpu, "apple,m4-relative-a", rel_a, size) ||
+        fdt_setprop(dt, gpu, "apple,m4-relative-b", rel_b, size) ||
+        fdt_setprop_u32(dt, gpu, "apple,m4-max-power-mw", 37237) ||
+        fdt_setprop_u32(dt, gpu, "apple,m4-core-mask", 0x3ff))
+        return -1;
+    return 0;
+}
+
+/* G16 owns a different initialization graph from G13/G14. Pass the boot
+ * firmware's memory contract through without running the older calibration
+ * serializer. Linux constructs the G16 graph in its own allocations. */
+static int dt_set_gpu_t8132(void *dt)
+{
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return 0;
+
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0)
+        bail("ADT: GPU: missing sgx node\n");
+
+    static const struct {
+        const char *adt_name;
+        const char *dt_path;
+    } regions[] = {
+        {"gpu-region", "/reserved-memory/uat-ttbs"},
+        {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
+        {"gfx-shared-l2-region", "/reserved-memory/uat-l2"},
+        {"gfx-handoff", "/reserved-memory/uat-handoff"},
+        {"gfx-data", "/reserved-memory/gpu-firmware"},
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(regions); i++) {
+        if (dt_set_region(dt, sgx, regions[i].adt_name, regions[i].dt_path))
+            return -1;
+    }
+
+    /* Adding properties can move the node. Resolve it after all reservations. */
+    gpu = fdt_path_offset(dt, "gpu");
+    u64 private_base, private_size;
+    if (ADT_GETPROP(adt, sgx, "rtkit-private-vm-region-base", &private_base) < 0 ||
+        ADT_GETPROP(adt, sgx, "rtkit-private-vm-region-size", &private_size) < 0 ||
+        !private_size)
+        bail("ADT: GPU: missing private VM region\n");
+
+    fdt64_t private_vm[2] = {cpu_to_fdt64(private_base), cpu_to_fdt64(private_size)};
+    if (fdt_setprop(dt, gpu, "apple,rtkit-private-vm-region", private_vm, sizeof(private_vm)))
+        return -1;
+    if (firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware) ||
+        firmware_set_fdt(dt, gpu, "apple,firmware-compat", &os_firmware) ||
+        firmware_set_fdt(dt, gpu, "apple,firmware-abi", &os_firmware))
+        return -1;
+    if (dt_set_gpu_t8132_adt(dt, gpu, sgx) || dt_set_gpu_t8132_perf(dt, gpu, sgx))
+        return -1;
+    if (fdt_setprop_string(dt, gpu, "status", "okay"))
+        return -1;
+
+    printf("FDT: GPU: T8132 firmware memory handoff ready\n");
+    return 0;
+}
+
 int dt_set_gpu(void *dt)
 {
+    if (chip_id == T8132)
+        return dt_set_gpu_t8132(dt);
+
     bool has_cs_afr = false;
     int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,
                       const struct perf_state *sram, const struct aux_perf_states *cs, u32 *max_pwr,
