@@ -149,7 +149,7 @@ static const struct copy_rule copy_rules[] = {
     },
 };
 
-static const struct copy_rule copy_rules_26_6_2[] = {
+static const struct copy_rule copy_rules_26_6[] = {
     {
         .prop = "asio-ascwrap-tunables",
         .fw_param = PARAM_TUNABLES,
@@ -228,8 +228,8 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
     }
 
     const struct copy_rule *rules =
-        os_firmware.version == V26_6_2 ? copy_rules_26_6_2 : copy_rules;
-    size_t nrules = os_firmware.version == V26_6_2 ? ARRAY_SIZE(copy_rules_26_6_2)
+        os_firmware.version == V26_6_2 ? copy_rules_26_6 : copy_rules;
+    size_t nrules = os_firmware.version == V26_6_2 ? ARRAY_SIZE(copy_rules_26_6)
                                                   : ARRAY_SIZE(copy_rules);
 
     for (size_t i = 0; i < nrules; i++) {
