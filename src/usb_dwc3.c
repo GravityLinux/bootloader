@@ -136,7 +136,7 @@ typedef struct dwc3_dev {
 } dwc3_dev_t;
 
 static const struct usb_string_descriptor str_manufacturer =
-    make_usb_string_descriptor("Asahi Linux");
+    make_usb_string_descriptor("Gravity Linux");
 static const struct usb_string_descriptor str_product =
     make_usb_string_descriptor("m1n1 uartproxy " BUILD_TAG);
 static const struct usb_string_descriptor str_serial_dummy = make_usb_string_descriptor("P-0");
