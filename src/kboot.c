@@ -1530,9 +1530,6 @@ static int dt_set_dcp_firmware(const char *alias)
         case V13_6_1:
             compat = &fw_versions[V13_5];
             break;
-        case V26_6_2:
-            compat = &fw_versions[V26_6];
-            break;
         default:
             compat = &os_firmware;
             break;
