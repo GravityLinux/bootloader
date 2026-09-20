@@ -72,6 +72,10 @@ ifeq ($(RELEASE),1)
 CFG += RELEASE
 endif
 
+ifeq ($(NO_DISPLAY),1)
+CFG += NO_DISPLAY
+endif
+
 # Required for no_std + alloc for now
 export RUSTC_BOOTSTRAP=1
 RUST_LIB := librust.a
