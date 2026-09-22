@@ -22,6 +22,7 @@ def sptm_hv_boot_args(extra=()):
         "sprr_tpro_pagers=0",    # ... same, for pager mappings
         "-v",                    # Optional: verbose boot
         f"msgbuf={1024 * 1024}", # Optional: enlarge the kernel msgbuf
+        "amfi_allow_only_tc_override=2",
     ]
     for arg in defaults:
         key = boot_arg_key(arg)
