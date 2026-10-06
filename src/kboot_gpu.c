@@ -534,7 +534,41 @@ static const struct t8132_gpu_board t8132_gpu_boards[] = {
         .max_power_mw = 37237,
         .core_mask = 0x3ff,
     },
+    {
+        /* MacBook Air 13" (M4). DERIVED, NOT CAPTURED: the ladder comes
+         * from this board's ADT; the curves are the mini's observed values
+         * at the same frequency steps, renormalized to this board's top
+         * step (B[4] interpolated: 836 MHz has no mini step); the limit is
+         * the ADT's clpc pkg-power-limit-spl-gpu-c0. See tmp/air-bringup
+         * FINDINGS.md. The core mask is read from the GPU at boot; the
+         * value here is only the fallback (cores 1 and 6 fused off on the
+         * first unit). */
+        .target = "J713",
+        .groups = 10,
+        .pwr_calib_a = {0, 10, 18, 27, 34, 46, 56, 68, 76, 100},
+        .pwr_calib_b = {0, 0, 0, 0, 6, 38, 55, 71, 80, 100},
+        .max_power_mw = 15827,
+        .core_mask = 0x3bd,
+    },
 };
+
+/* Enabled GPU cores, from the GPU itself (as upstream reads G14X's masks at
+ * the same offset). Binned parts differ per unit, so the board value is only
+ * a fallback. */
+static u32 t8132_gpu_core_mask(const struct t8132_gpu_board *board)
+{
+    int path[8];
+    u64 base;
+
+    if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &base, NULL) < 0)
+        return board->core_mask;
+    pmgr_adt_power_enable("/arm-io/sgx");
+    u32 mask = read32(base + 0xe01500) & 0x3ff;
+    printf("FDT: GPU: core mask %#x from the GPU (board default %#x)\n", mask,
+           board->core_mask);
+    return mask ? mask : board->core_mask;
+}
 
 static const struct t8132_gpu_board *t8132_gpu_board(void)
 {
@@ -610,7 +644,7 @@ static int dt_set_gpu_t8132_perf(void *dt, int gpu, int sgx,
         fdt_setprop(dt, gpu, "apple,m4-relative-a", rel_a, size) ||
         fdt_setprop(dt, gpu, "apple,m4-relative-b", rel_b, size) ||
         fdt_setprop_u32(dt, gpu, "apple,m4-max-power-mw", board->max_power_mw) ||
-        fdt_setprop_u32(dt, gpu, "apple,m4-core-mask", board->core_mask))
+        fdt_setprop_u32(dt, gpu, "apple,m4-core-mask", t8132_gpu_core_mask(board)))
         return -1;
     return 0;
 }
