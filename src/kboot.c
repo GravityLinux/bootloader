@@ -2864,6 +2864,15 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_isp_fwdata())
         return -1;
+    /*
+     * The MTP coprocessor DMAs to its iBoot-provided segments (__OS_LOG in
+     * DRAM) before it sends the RTKit HELLO, so its DART must map them from
+     * the first instruction. Its DVAs are the segments' remap addresses,
+     * which fall in the DART's vm-base window. Boards without an "mtp"
+     * alias are skipped.
+     */
+    if (dt_reserve_asc_firmware("/arm-io/mtp", NULL, "mtp", true, 0))
+        return -1;
     if (dt_set_pmgr())
         return -1;
 #ifndef RELEASE
@@ -2909,9 +2918,14 @@ int kboot_boot(void *kernel)
 
     usb_init();
     pcie_init();
-    /* HACK: DAPF init raises an SError on T8132. */
+    /*
+     * HACK: initializing every DAPF raises an SError on T8132. The MTP one is
+     * safe and required: its coprocessor DMAs to DRAM before the RTKit HELLO.
+     */
     if (chip_id != T8132)
         dapf_init_all();
+    else if (adt_path_offset(adt, "/arm-io/dart-mtp") >= 0)
+        dapf_init("/arm-io/dart-mtp", 1);
 
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
