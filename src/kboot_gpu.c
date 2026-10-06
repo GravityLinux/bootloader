@@ -513,7 +513,42 @@ static int dt_set_gpu_t8132_adt(void *dt, int gpu, int sgx)
     return 0;
 }
 
-static int dt_set_gpu_t8132_perf(void *dt, int gpu, int sgx)
+/* Per-board G16 inputs the ADT doesn't carry: per-step relative maximum power
+ * curves (percent, one entry per voltage group including off), the GPU power
+ * limit and the core mask. Boards without an entry get no GPU. */
+struct t8132_gpu_board {
+    const char *target;
+    u32 groups;
+    u32 pwr_calib_a[MAX_PSTATES];
+    u32 pwr_calib_b[MAX_PSTATES];
+    u32 max_power_mw;
+    u32 core_mask;
+};
+
+static const struct t8132_gpu_board t8132_gpu_boards[] = {
+    {
+        .target = "J773g", /* Mac mini (M4) */
+        .groups = 11,
+        .pwr_calib_a = {0, 8, 14, 21, 27, 36, 44, 54, 60, 79, 100},
+        .pwr_calib_b = {0, 0, 0, 0, 16, 33, 47, 61, 69, 86, 100},
+        .max_power_mw = 37237,
+        .core_mask = 0x3ff,
+    },
+};
+
+static const struct t8132_gpu_board *t8132_gpu_board(void)
+{
+    const char *target = adt_getprop(adt, 0, "target-type", NULL);
+    if (!target)
+        return NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(t8132_gpu_boards); i++)
+        if (!strcmp(target, t8132_gpu_boards[i].target))
+            return &t8132_gpu_boards[i];
+    return NULL;
+}
+
+static int dt_set_gpu_t8132_perf(void *dt, int gpu, int sgx,
+                                 const struct t8132_gpu_board *board)
 {
     u32 count, tables, core_len, sram_len;
     if (ADT_GETPROP(adt, sgx, "perf-state-count", &count) < 0 ||
@@ -553,15 +588,17 @@ static int dt_set_gpu_t8132_perf(void *dt, int gpu, int sgx)
         groups++;
         first = last + 1;
     }
-    if (groups != 11)
-        bail("ADT: GPU: expected eleven M4 voltage steps, found %u\n", groups);
+    /* Group 0 is the off state; the calibration curves are per group. */
+    if (groups < 2 || core[0].freq != 0)
+        bail("ADT: GPU: M4 performance table has no off state\n");
+    if (groups != board->groups)
+        bail("ADT: GPU: %s has %u voltage steps, its calibration has %u\n", board->target,
+             groups, board->groups);
 
-    static const u32 pwr_calib_a[] = {0, 8, 14, 21, 27, 36, 44, 54, 60, 79, 100};
-    static const u32 pwr_calib_b[] = {0, 0, 0, 0, 16, 33, 47, 61, 69, 86, 100};
-    fdt32_t rel_a[11], rel_b[11];
+    fdt32_t rel_a[MAX_PSTATES], rel_b[MAX_PSTATES];
     for (u32 i = 0; i < groups; i++) {
-        rel_a[i] = cpu_to_fdt32(pwr_calib_a[i]);
-        rel_b[i] = cpu_to_fdt32(pwr_calib_b[i]);
+        rel_a[i] = cpu_to_fdt32(board->pwr_calib_a[i]);
+        rel_b[i] = cpu_to_fdt32(board->pwr_calib_b[i]);
     }
     size_t size = groups * sizeof(fdt32_t);
     if (fdt_setprop(dt, gpu, "apple,m4-freq-a", freq_a, size) ||
@@ -572,8 +609,8 @@ static int dt_set_gpu_t8132_perf(void *dt, int gpu, int sgx)
         fdt_setprop(dt, gpu, "apple,m4-memory-voltage", memory_voltage, size) ||
         fdt_setprop(dt, gpu, "apple,m4-relative-a", rel_a, size) ||
         fdt_setprop(dt, gpu, "apple,m4-relative-b", rel_b, size) ||
-        fdt_setprop_u32(dt, gpu, "apple,m4-max-power-mw", 37237) ||
-        fdt_setprop_u32(dt, gpu, "apple,m4-core-mask", 0x3ff))
+        fdt_setprop_u32(dt, gpu, "apple,m4-max-power-mw", board->max_power_mw) ||
+        fdt_setprop_u32(dt, gpu, "apple,m4-core-mask", board->core_mask))
         return -1;
     return 0;
 }
@@ -586,6 +623,13 @@ static int dt_set_gpu_t8132(void *dt)
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0)
         return 0;
+
+    const struct t8132_gpu_board *board = t8132_gpu_board();
+    if (!board) {
+        printf("FDT: GPU: no power calibration for %s; disabling the GPU\n",
+               (const char *)adt_getprop(adt, 0, "target-type", NULL) ?: "this board");
+        return fdt_setprop_string(dt, gpu, "status", "disabled") ? -1 : 0;
+    }
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     if (sgx < 0)
@@ -621,7 +665,7 @@ static int dt_set_gpu_t8132(void *dt)
         firmware_set_fdt(dt, gpu, "apple,firmware-compat", &os_firmware) ||
         firmware_set_fdt(dt, gpu, "apple,firmware-abi", &os_firmware))
         return -1;
-    if (dt_set_gpu_t8132_adt(dt, gpu, sgx) || dt_set_gpu_t8132_perf(dt, gpu, sgx))
+    if (dt_set_gpu_t8132_adt(dt, gpu, sgx) || dt_set_gpu_t8132_perf(dt, gpu, sgx, board))
         return -1;
     if (fdt_setprop_string(dt, gpu, "status", "okay"))
         return -1;
