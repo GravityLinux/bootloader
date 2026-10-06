@@ -380,12 +380,24 @@ static int dt_set_memory(void)
         u64 ctrr_start = ALIGN_DOWN(mrs(SYS_IMP_APL_CTRR_LOWER_EL1), get_page_size());
         u64 ctrr_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_UPPER_EL1) + SZ_4K, get_page_size());
 
-        if (ctrr_start < dram_min || ctrr_end <= ctrr_start || ctrr_end > dram_max)
+        if (ctrr_end <= ctrr_start)
             bail("FDT: Invalid CTRR range 0x%lx..0x%lx\n", ctrr_start, ctrr_end);
 
-        printf("FDT: Reserving CTRR range 0x%lx..0x%lx\n", ctrr_start, ctrr_end);
-        if (fdt_add_mem_rsv(dt, ctrr_start, ctrr_end - ctrr_start))
-            bail("FDT: Could not reserve CTRR range\n");
+        if (ctrr_end <= dram_min || ctrr_start >= dram_max) {
+            /*
+             * Outside the memory we hand to Linux (e.g. as a hypervisor guest,
+             * where this is the host's CTRR range): nothing to reserve.
+             */
+            printf("FDT: CTRR range 0x%lx..0x%lx outside usable memory, not reserving\n",
+                   ctrr_start, ctrr_end);
+        } else {
+            if (ctrr_start < dram_min || ctrr_end > dram_max)
+                bail("FDT: CTRR range 0x%lx..0x%lx straddles usable memory\n", ctrr_start,
+                     ctrr_end);
+            printf("FDT: Reserving CTRR range 0x%lx..0x%lx\n", ctrr_start, ctrr_end);
+            if (fdt_add_mem_rsv(dt, ctrr_start, ctrr_end - ctrr_start))
+                bail("FDT: Could not reserve CTRR range\n");
+        }
     }
 
     printf("FDT: DRAM at 0x%lx size 0x%lx\n", dram_base, dram_size);
