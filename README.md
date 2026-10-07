@@ -87,9 +87,9 @@ Supported compression formats:
 Beginning with and including commit
 [`df7656cf17d04ec19de8acb8a78d57cc9b48fda1`](https://github.com/ADevWithAnIdea/m1n1/commit/df7656cf17d04ec19de8acb8a78d57cc9b48fda1),
 fork-authored contributions on this fork's main branch are licensed under the
-[GNU General Public License, version 2 only](LICENSE.GPL2) (`GPL-2.0-only`).
+[GNU General Public License, version 2 or later](LICENSE.GPL2) (`GPL-2.0-or-later`).
 The combined work distributed by this fork from that commit onward is
-distributed under the GPL version 2 only, except for components that retain a
+distributed under the GPL version 2 or later, except for components that retain a
 separate license as described below.
 
 Commits before `df7656cf17d04ec19de8acb8a78d57cc9b48fda1` retain the

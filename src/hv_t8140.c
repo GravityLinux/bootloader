@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * This T8140 CPU/ACC/CPM hook is a horrible hack that we don't know how to
  * get rid of. We spent almost two weeks experimenting and ultimately

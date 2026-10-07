@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013-2020, ARM Limited and Contributors. All rights reserved.
  *
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #define LOC_SHIFT		24
