@@ -199,9 +199,8 @@ void hv_start(void *entry, u64 regs[4])
 
     hv_started_cpus[boot_cpu_idx] = true;
 
-    // Install the T8140 CPU/ACC/CPM write guard before the guest runs (no-op on
-    // other SoCs). Must be after the guest's device mappings are established.
-    hv_t8140_map_accumulators();
+    // Install CPU/CPM power-state guards after guest device mappings exist.
+    hv_map_power_register_guard();
 
     msr(VBAR_EL1, _hv_vectors_start);
 
