@@ -810,11 +810,13 @@ static void mmu_remap_ranges(void)
     }
 }
 
+static void mmu_map_nc_aliases(u64 addr, size_t size, const char *name);
+
 void mmu_map_framebuffer(u64 addr, size_t size)
 {
-    printf("MMU: Adding Normal-NC mapping at 0x%lx (0x%zx) for framebuffer\n", addr, size);
     dc_civac_range((void *)addr, size);
-    mmu_add_mapping(addr, addr, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
+    sysop("dsb sy");
+    mmu_map_nc_aliases(addr, size, "framebuffer");
 }
 
 int display_get_vram(u64 *paddr, u64 *size);
@@ -887,6 +889,17 @@ static void mmu_map_nc_aliases(u64 addr, size_t size, const char *name)
 
     printf("MMU: Adding Normal-NC mappings at 0x%lx..0x%lx for %s\n",
            start, end, name);
+
+    // Break all live aliases before changing the framebuffer from WB to NC.
+    if (mmu_active()) {
+        if (mmu_map(start, 0, map_size) < 0 ||
+            mmu_map(start | REGION_RWX_EL0, 0, map_size) < 0 ||
+            mmu_map(start | REGION_RW_EL0, 0, map_size) < 0 ||
+            mmu_map(start | REGION_RX_EL1, 0, map_size) < 0)
+            panic("Failed to break live mappings for %s\n", name);
+        mmu_publish_mappings();
+    }
+
     mmu_add_mapping(start, start, map_size, MAIR_IDX_NORMAL_NC, PERM_RWX);
     mmu_add_mapping(start | REGION_RWX_EL0, start, map_size,
                     MAIR_IDX_NORMAL_NC, PERM_RWX_EL0);
