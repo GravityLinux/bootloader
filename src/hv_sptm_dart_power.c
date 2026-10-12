@@ -271,10 +271,17 @@ static bool sptm_dart_program_sids(struct sptm_dart *dart)
         for (size_t index = 0; index < dart->instance_count; index++) {
             u64 base = dart->instances[index];
             if (read32(base + DART_REG_PROTECT) & BIT(0)) {
+                u32 hardware_tcr = read32(base + DART_TCR + sid * sizeof(u32));
+                u32 hardware_ttbr = read32(base + DART_TTBR + sid * sizeof(u32));
+                // Firmware can leave unused streams locked with translation enabled
+                // but no root. Preserve them when policy needs no translation.
+                if (!(state->tcr & DART_TCR_TRANSLATE) &&
+                    !(hardware_ttbr & DART_TTBR_VALID))
+                    continue;
                 // Ignore stale locked TTBRs for non-translating SIDs.
-                if (read32(base + DART_TCR + sid * sizeof(u32)) != state->tcr ||
+                if (hardware_tcr != state->tcr ||
                     ((state->tcr & DART_TCR_TRANSLATE) &&
-                     read32(base + DART_TTBR + sid * sizeof(u32)) != ttbr))
+                     hardware_ttbr != ttbr))
                     return false;
                 continue;
             }

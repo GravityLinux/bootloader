@@ -191,6 +191,9 @@ void hv_start(void *entry, u64 regs[4])
         return;
     }
 
+    // Give the guest this core's identity instead of stale firmware state.
+    msr(VMPIDR_EL2, mrs(MPIDR_EL1));
+
     memset(hv_should_exit, 0, sizeof(hv_should_exit));
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
 
@@ -271,6 +274,9 @@ void hv_start(void *entry, u64 regs[4])
 
 static void hv_init_secondary(struct hv_secondary_info_t *info)
 {
+    // Give the guest this core's identity instead of stale firmware state.
+    msr(VMPIDR_EL2, mrs(MPIDR_EL1));
+
     if (cpu_features->apple_sysregs_unlocked)
         gxf_init();
 

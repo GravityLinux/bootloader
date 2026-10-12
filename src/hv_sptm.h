@@ -20,6 +20,7 @@ void hv_sptm_configure_nvme(u64 config);
 void hv_sptm_configure_dart(u64 info, u64 config, u64 instance0, u64 instance1, u64 instance2,
                             u64 instance3);
 bool hv_sptm_handle_hvc(struct exc_info *ctx, u32 immediate);
+bool hv_sptm_handle_hvc_unlocked(struct exc_info *ctx, u32 immediate);
 void sptm_boot_prepare_start(void **entry, u64 regs[4], bool secondary);
 bool hv_handle_clpc_hvc(struct exc_info *ctx, u32 immediate);
 
