@@ -27,6 +27,7 @@
 #define SYS_IMP_APL_KERNEL_CNTV_TVAL_EL0 sys_reg(3, 1, 15, 15, 4)
 #define SYS_IMP_APL_KERNEL_CNTVCT_EL0    sys_reg(3, 4, 15, 11, 7)
 #define SYS_IMP_APL_KERNEL_CNTKCTL_EL1   sys_reg(3, 4, 15, 9, 6)
+#define SYS_IMP_APL_S3_1_C15_C13_3      sys_reg(3, 1, 15, 13, 3)
 #define SYS_IMP_APL_JCTL_EL0             sys_reg(3, 4, 15, 15, 6)
 
 /* HID registers */
