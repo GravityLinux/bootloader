@@ -667,6 +667,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
     switch (reg) {
         SYSREG_PASS(SYS_IMP_APL_CORE_NRG_ACC_DAT);
         SYSREG_PASS(SYS_IMP_APL_CORE_SRM_NRG_ACC_DAT);
+        case SYSREG_ISS(SYS_IMP_APL_S3_1_C15_C13_3):
+            // PPM polls this register frequently. Match Python's hardware
+            // pass-through locally instead of stopping all CPUs for each read.
+            if (!is_read)
+                return false;
+            regs[rt] = mrs(SYS_IMP_APL_S3_1_C15_C13_3);
+            return true;
         /* Architectural timer, for ECV */
         SYSREG_MAP(SYS_CNTV_CTL_EL0, SYS_CNTV_CTL_EL02)
         SYSREG_MAP(SYS_CNTV_CVAL_EL0, SYS_CNTV_CVAL_EL02)
@@ -1039,11 +1046,17 @@ void hv_exc_sync(struct exc_info *ctx)
                     break;
             }
             break;
+        case ESR_EC_HVC:
+            handled = hv_sptm_handle_hvc_unlocked(ctx, FIELD_GET(ESR_ISS, ctx->esr) & 0xffff);
+            // HVC saves the address after the call, unlike a trapped MSR/MRS.
+            advance = false;
+            break;
     }
 
     if (handled) {
         hv_wdt_breadcrumb('#');
-        ctx->elr += 4;
+        if (advance)
+            ctx->elr += 4;
         hv_set_elr(ctx->elr);
         hv_update_fiq();
         hv_wdt_breadcrumb('s');

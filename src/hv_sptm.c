@@ -125,6 +125,19 @@ static bool sptm_handle_shadow_hvc(struct exc_info *ctx, u32 immediate)
     return false;
 }
 
+bool hv_sptm_handle_hvc_unlocked(struct exc_info *ctx, u32 immediate)
+{
+    if (!sptm.enabled)
+        return false;
+
+    // CLPC shadows and counter biases belong to the current CPU. They do not
+    // need the global HV lock used by page-table and device services.
+    if (immediate >= 0x400 && immediate < 0xa40)
+        return hv_handle_clpc_hvc(ctx, immediate);
+
+    return false;
+}
+
 bool hv_sptm_handle_hvc(struct exc_info *ctx, u32 immediate)
 {
     if (!sptm.enabled)
