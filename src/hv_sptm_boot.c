@@ -5,9 +5,9 @@
 #include "adt.h"
 #include "xnuboot.h"
 
-#define SPTM_AUX_SIZE              (64 * SZ_1M)
+// Headroom for fixed boot objects and ADT-derived platform configuration.
+#define SPTM_AUX_FIXED_SIZE        (64 * SZ_1M)
 #define SPTM_CPU_STACK_WINDOW_SIZE SZ_1M
-#define SPTM_BOOT_MAX_TABLES       1024
 #define SPTM_BOOTSTRAP_SIZE        0x340
 #define SPTM_FRAME_ENTRY_SIZE      16
 #define SPTM_FRAME_PARAM_SIZE      0x90
@@ -150,14 +150,15 @@ static struct {
     u64 bootargs_va;
     u64 bootstrap_va;
     u64 panic_state_pa;
-    struct sptm_boot_pt_page pages[SPTM_BOOT_MAX_TABLES];
+    struct sptm_boot_pt_page *pages;
+    size_t page_capacity;
     u32 page_count;
 } sptm_boot;
 
 static void *sptm_boot_alloc(struct sptm_boot_allocator *allocator, size_t size, size_t alignment)
 {
     u64 address = ALIGN_UP(allocator->next, alignment);
-    assert(address + size <= allocator->end);
+    assert(address <= allocator->end && size <= allocator->end - address);
     allocator->next = address + size;
     return (void *)address;
 }
@@ -227,7 +228,7 @@ static u64 sptm_boot_va(const struct sptm_boot_context *context, u64 pa)
 static u64 sptm_boot_alloc_table(struct sptm_boot_context *context, u8 level)
 {
     u64 pa = (u64)sptm_boot_alloc_zero(&context->allocator, SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    assert(sptm_boot.page_count < ARRAY_SIZE(sptm_boot.pages));
+    assert(sptm_boot.page_count < sptm_boot.page_capacity);
     sptm_boot.pages[sptm_boot.page_count++] = (struct sptm_boot_pt_page){pa, level};
     return pa;
 }
@@ -270,6 +271,17 @@ static void sptm_boot_preallocate_l3(struct sptm_boot_context *context, u64 root
 {
     for (u64 va = ALIGN_DOWN(start, SZ_32M); va < ALIGN_UP(end, SZ_32M); va += SZ_32M)
         sptm_boot_ensure_l3(context, root, va);
+}
+
+// Upper bound for the L2 and L3 tables touched by a half-open VA range.
+// Count ranges independently: overlapping ranges only make the bound safer.
+static size_t sptm_boot_range_tables(u64 start, u64 end)
+{
+    if (start == end)
+        return 0;
+    assert(start < end);
+    return ((end - 1) >> 25) - (start >> 25) + 1 +
+           ((end - 1) >> 36) - (start >> 36) + 1;
 }
 
 static u16 sptm_boot_valid_count(u64 table)
@@ -419,13 +431,55 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     context.managed_end = bootargs->phys_base + bootargs->mem_size;
     context.physmap_base = bootargs->virt_base;
     context.physmap_end = bootargs->virt_base + bootargs->mem_size;
+    assert(context.managed_end > context.managed_start);
+    assert(context.physmap_end > context.physmap_base);
+    sptm_boot_macho_info(&context);
+
+    u64 trustcache_pa, trustcache_size;
+    sptm_boot_adt_region(memory_map, "TrustCache", &trustcache_pa, &trustcache_size);
+    u64 adt_pa = ALIGN_DOWN(guest_adt, SPTM_PAGE_SIZE);
+    u64 adt_offset = guest_adt - adt_pa;
+    u64 adt_size = ALIGN_UP(adt_offset + bootargs->devtree_size, SPTM_PAGE_SIZE);
+    u64 extradata_pa = min(adt_pa, ALIGN_DOWN(trustcache_pa, SPTM_PAGE_SIZE));
+    u64 extradata_end =
+        max(adt_pa + adt_size, ALIGN_UP(trustcache_pa + trustcache_size, SPTM_PAGE_SIZE));
+    u64 extradata_size = extradata_end - extradata_pa;
+    u64 extradata_va = ALIGN_DOWN(context.kernel_vmin - extradata_size, SPTM_PAGE_SIZE);
+
+    // XNU adopts these empty L3s before normal pmap allocation is operational.
+    // The fixed 64 MiB term stands in for the boot framebuffer size.
+    u64 memory_segments = ALIGN_UP(bootargs->mem_size, BIT(28)) >> 28;
+    u64 dynamic_l3_start = ALIGN_UP(context.physmap_end, SZ_32M);
+    u64 dynamic_budget = (2 + memory_segments * 10) * SZ_1M;
+    u64 dynamic_l3_end = ALIGN_UP(dynamic_l3_start + dynamic_budget + 64 * SZ_1M, 8 * SZ_1M);
+    context.uat_l2_va = ALIGN_UP(dynamic_l3_end, SZ_32M);
+    u64 high_l3_end = SPTM_VM_MAX_KERNEL_ADDRESS + 1;
+
+    // Two roots, then the tables for every mapping/preallocation below.
+    sptm_boot.page_capacity = 2 + sptm_boot_range_tables(0, SPTM_PAGE_SIZE) +
+        sptm_boot_range_tables(context.kernel_vmin, ALIGN_UP(context.kernel_vmax, SPTM_PAGE_SIZE)) +
+        sptm_boot_range_tables(context.physmap_base, context.physmap_end) +
+        sptm_boot_range_tables(extradata_va, extradata_va + extradata_size) +
+        sptm_boot_range_tables(dynamic_l3_start, ALIGN_UP(dynamic_l3_end, SZ_32M)) +
+        sptm_boot_range_tables(context.uat_l2_va, context.uat_l2_va + SPTM_PAGE_SIZE) +
+        sptm_boot_range_tables(high_l3_end - SZ_32M, high_l3_end);
+    size_t managed_pages = (context.managed_end - context.managed_start) / SPTM_PAGE_SIZE;
+    size_t frame_table_size = managed_pages * SPTM_FRAME_ENTRY_SIZE;
+    size_t external_ref_table_size = managed_pages * sizeof(u64);
+    size_t table_records_size = sptm_boot.page_capacity * sizeof(*sptm_boot.pages);
+    u64 aux_size = ALIGN_UP(SPTM_AUX_FIXED_SIZE + frame_table_size + external_ref_table_size +
+                           managed_pages + table_records_size +
+                           sptm_boot.page_capacity * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     u64 aux_start = ALIGN_UP(bootargs->top_of_kernel_data, SPTM_PAGE_SIZE);
-    u64 aux_end = aux_start + SPTM_AUX_SIZE;
+    assert(aux_start >= context.managed_start && aux_start <= context.managed_end);
+    assert(aux_size <= context.managed_end - aux_start);
+    u64 aux_end = aux_start + aux_size;
     context.allocator = (struct sptm_boot_allocator){aux_start, aux_end};
     // Keep every handoff object below the RAM XNU is allowed to allocate.
     bootargs->top_of_kernel_data = aux_end;
-
-    sptm_boot_macho_info(&context);
+    sptm_boot.pages = sptm_boot_alloc(&context.allocator, table_records_size, 8);
+    printf("HV: SPTM boot reservation: 0x%lx bytes, %zu table records\n",
+           aux_size, sptm_boot.page_capacity);
 
     int cpus = adt_path_offset(adt, "/cpus");
     u32 cpu_count = 0;
@@ -447,10 +501,6 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
     bool uat_tlbi_at_retype = sptm_boot_bool_property(uat_nodes, ARRAY_SIZE(uat_nodes),
                                                       "issue-gmmu-tlbis-at-retype", false);
     context.uat_gpu_region_pa = sptm_boot_adt_integer(sgx, "gpu-region-base", 0);
-
-    size_t managed_pages = (context.managed_end - context.managed_start) / SPTM_PAGE_SIZE;
-    size_t frame_table_size = managed_pages * SPTM_FRAME_ENTRY_SIZE;
-    size_t external_ref_table_size = managed_pages * 8;
 
     context.bootstrap_pa = (u64)sptm_boot_alloc_zero(&context.allocator, SPTM_BOOTSTRAP_SIZE, 16);
     u64 debug_header_pa = (u64)sptm_boot_alloc_zero(&context.allocator, 0x100, 16);
@@ -529,35 +579,17 @@ u64 sptm_boot_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_te
                           context.uat_global_root_pa, SPTM_LEAF_DATA_NC);
 
     // XNU expects the locked ADT and TrustCache as EXTRADATA just below the kernelcache.
-    u64 trustcache_pa, trustcache_size;
-    sptm_boot_adt_region(memory_map, "TrustCache", &trustcache_pa, &trustcache_size);
-    u64 adt_pa = ALIGN_DOWN(guest_adt, SPTM_PAGE_SIZE);
-    u64 adt_offset = guest_adt - adt_pa;
-    u64 adt_size = ALIGN_UP(adt_offset + bootargs->devtree_size, SPTM_PAGE_SIZE);
-    u64 extradata_pa = min(adt_pa, ALIGN_DOWN(trustcache_pa, SPTM_PAGE_SIZE));
-    u64 extradata_end =
-        max(adt_pa + adt_size, ALIGN_UP(trustcache_pa + trustcache_size, SPTM_PAGE_SIZE));
-    u64 extradata_size = extradata_end - extradata_pa;
-    u64 extradata_va = ALIGN_DOWN(context.kernel_vmin - extradata_size, SPTM_PAGE_SIZE);
     sptm_boot_map_range(&context, context.ttbr1_pa, extradata_va, extradata_pa, extradata_size,
                         data_leaf);
     bootargs->devtree = (void *)(extradata_va + guest_adt - extradata_pa);
 
     context.uat_l2_pa = sptm_boot_adt_integer(sgx, "gfx-shared-l2-region-base", 0);
     u64 uat_l2_size = sptm_boot_adt_integer(sgx, "gfx-shared-l2-region-size", 0);
-    // XNU adopts these empty L3s before normal pmap allocation is operational.
-    // The fixed 64 MiB term stands in for the boot framebuffer size.
-    u64 memory_segments = ALIGN_UP(bootargs->mem_size, BIT(28)) >> 28;
-    u64 dynamic_l3_start = ALIGN_UP(context.physmap_end, SZ_32M);
-    u64 dynamic_budget = (2 + memory_segments * 10) * SZ_1M;
-    u64 dynamic_l3_end = ALIGN_UP(dynamic_l3_start + dynamic_budget + 64 * SZ_1M, 8 * SZ_1M);
     sptm_boot_preallocate_l3(&context, context.ttbr1_pa, dynamic_l3_start, dynamic_l3_end);
     // Keep the firmware-owned selector-9 page outside the physmap and empty-table range.
-    context.uat_l2_va = ALIGN_UP(dynamic_l3_end, SZ_32M);
     sptm_boot_map_page(&context, context.ttbr1_pa, context.uat_l2_va, context.uat_l2_pa,
                        SPTM_LEAF_DATA_NC);
     // The topmost L3 backs early debug data and per-CPU copy windows.
-    u64 high_l3_end = SPTM_VM_MAX_KERNEL_ADDRESS + 1;
     sptm_boot_preallocate_l3(&context, context.ttbr1_pa, high_l3_end - SZ_32M, high_l3_end);
 
     // Seed frames already live at handoff; XNU types the remaining RAM as it claims it.
