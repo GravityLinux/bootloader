@@ -8,6 +8,9 @@
 // Headroom for fixed boot objects and ADT-derived platform configuration.
 #define SPTM_AUX_FIXED_SIZE        (64 * SZ_1M)
 #define SPTM_CPU_STACK_WINDOW_SIZE SZ_1M
+// TXM indexes a compile-time channel array (16 slots on T6041), even when
+// fewer CPU IDs are present in the ADT. Back every supported slot.
+#define SPTM_TXM_BOOT_CHANNELS MAX_CPUS
 #define SPTM_BOOTSTRAP_SIZE        0x340
 #define SPTM_FRAME_ENTRY_SIZE      16
 #define SPTM_FRAME_PARAM_SIZE      0x90
@@ -440,7 +443,7 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     int cpu = cpus;
     ADT_FOREACH_CHILD(adt, cpu)
     cpu_count = max(cpu_count, (u32)sptm_adt_integer(cpu, "cpu-id", 0) + 1);
-    assert(cpu_count <= MAX_CPUS);
+    assert(cpu_count && cpu_count <= MAX_CPUS);
 
     int sgx = adt_path_offset(adt, "/arm-io/sgx");
     int defaults = adt_path_offset(adt, "/defaults");
@@ -466,8 +469,8 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     u64 saved_states_pa = sptm_boot_alloc_page(&context);
     u64 event_counters_pa = sptm_boot_alloc_page(&context);
     context.scratch_pa = sptm_boot_alloc(&context, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
-    u64 txm_stack_array_pa = sptm_boot_alloc(&context, cpu_count * sizeof(u64), 8);
-    u64 txm_stacks_pa = sptm_boot_alloc(&context, cpu_count * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
+    u64 txm_stack_array_pa = sptm_boot_alloc(&context, SPTM_TXM_BOOT_CHANNELS * sizeof(u64), 8);
+    u64 txm_stacks_pa = sptm_boot_alloc(&context, SPTM_TXM_BOOT_CHANNELS * SPTM_PAGE_SIZE, SPTM_PAGE_SIZE);
     u64 txm_info_pa = sptm_boot_alloc_page(&context);
     context.txm_info_va = sptm_boot_va(&context, txm_info_pa);
     context.uat_global_state_pa = sptm_boot_alloc_page(&context);
@@ -580,7 +583,7 @@ u64 hv_sptm_init(u64 guest_adt, u64 cons_ops, u64 page_shift_const, u64 xnu_text
     cpu = cpus;
     ADT_FOREACH_CHILD(adt, cpu)
     sptm.hv_phys_ids[sptm_adt_integer(cpu, "cpu-id", 0)] = sptm_adt_integer(cpu, "reg", 0);
-    for (u32 index = 0; index < cpu_count; index++)
+    for (u32 index = 0; index < SPTM_TXM_BOOT_CHANNELS; index++)
         write64(txm_stack_array_pa + index * sizeof(u64),
                 sptm_boot_va(&context, txm_stacks_pa + index * SPTM_PAGE_SIZE));
     // TXM uses this zeroed policy page to disable monitor signing and enable developer mode.
