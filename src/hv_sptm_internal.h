@@ -26,7 +26,7 @@
 
 #define SPTM_MAX_SCRATCH_ENTRIES (SPTM_PAGE_SIZE / sizeof(u64))
 #define SPTM_SERIAL_LINE_SIZE    512
-#define SPTM_MAX_DARTS           32
+#define SPTM_MAX_DARTS           64
 #define SPTM_MAX_DART_INSTANCES  4
 #define SPTM_MAX_DART_SIDS       256
 #define SPTM_MAX_DART_PAGES      65536
