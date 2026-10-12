@@ -154,7 +154,7 @@ bool sptm_handle_nvme(struct exc_info *ctx, u32 endpoint)
             sysop("dsb sy");
             sptm_nvme_mmio_write64_lo_hi(nvme->nvmmu + NVMMU_ADMIN_TCB_BASE, nvme->admin_tcbs);
             sptm_nvme_mmio_write64_lo_hi(nvme->nvmmu + NVMMU_IO_TCB_BASE, nvme->io_tcbs);
-            sptm_nvme_mmio_write32(nvme->nvmmu + NVMMU_QUEUE_COUNT, nvme->queue_entries - 1);
+            sptm_nvme_mmio_write32(nvme->nvmmu + NVMMU_QUEUE_COUNT, SPTM_NVME_HARDWARE_TAGS - 1);
             break;
         case 1:
             handled = sptm_nvme_map_pages(ctx);
