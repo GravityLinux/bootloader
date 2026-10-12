@@ -336,8 +336,9 @@ bool sptm_handle_nvme(struct exc_info *ctx, u32 endpoint)
             sptm_nvme_mmio_write64_lo_hi(sptm.nvme.nvmmu + NVMMU_ADMIN_TCB_BASE,
                                          sptm.nvme.admin_tcbs);
             sptm_nvme_mmio_write64_lo_hi(sptm.nvme.nvmmu + NVMMU_IO_TCB_BASE, sptm.nvme.io_tcbs);
+            // NVMMU has 64 hardware tags, regardless of the guest queue depth.
             sptm_nvme_mmio_write32(sptm.nvme.nvmmu + NVMMU_QUEUE_COUNT,
-                                   sptm.nvme.queue_entries - 1);
+                                   SPTM_NVME_HARDWARE_TAGS - 1);
             sptm.nvme.coastguard_enabled = true;
             spin_unlock(&sptm.service_lock);
             ctx->regs[0] = SPTM_STATUS_SUCCESS;
