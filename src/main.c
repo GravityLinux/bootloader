@@ -21,6 +21,7 @@
 #include "pcie.h"
 #include "pmgr.h"
 #include "pmu.h"
+#include "sapt.h"
 #include "sep.h"
 #include "smp.h"
 #include "string.h"
@@ -157,6 +158,7 @@ void m1n1_main(void)
         gxf_init();
     mcc_init();
     mmu_init();
+    sapt_disable();
     aic_init();
 #endif
     wdt_disable();
