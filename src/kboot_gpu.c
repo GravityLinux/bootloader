@@ -523,6 +523,9 @@ struct t8132_gpu_board {
     u32 pwr_calib_b[MAX_PSTATES];
     u32 max_power_mw;
     u32 core_mask;
+    /* Read the enabled cores from the GPU: binned parts differ per unit. Only for boards
+     * where that read is validated; on the mini (J773g) it data-aborts (stage2smoke-mini-v1). */
+    bool read_core_mask;
 };
 
 static const struct t8132_gpu_board t8132_gpu_boards[] = {
@@ -533,6 +536,7 @@ static const struct t8132_gpu_board t8132_gpu_boards[] = {
         .pwr_calib_b = {0, 0, 0, 0, 16, 33, 47, 61, 69, 86, 100},
         .max_power_mw = 37237,
         .core_mask = 0x3ff,
+        .read_core_mask = false,
     },
     {
         /* MacBook Air 13" (M4). DERIVED, NOT CAPTURED: the ladder comes
@@ -549,6 +553,7 @@ static const struct t8132_gpu_board t8132_gpu_boards[] = {
         .pwr_calib_b = {0, 0, 0, 0, 6, 38, 55, 71, 80, 100},
         .max_power_mw = 15827,
         .core_mask = 0x3bd,
+        .read_core_mask = true,
     },
 };
 
@@ -558,11 +563,18 @@ static const struct t8132_gpu_board t8132_gpu_boards[] = {
 static u32 t8132_gpu_core_mask(const struct t8132_gpu_board *board)
 {
     int path[8];
-    u64 base;
+    u64 base, size;
 
-    if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
-        adt_get_reg(adt, path, "reg", 0, &base, NULL) < 0)
+    if (!board->read_core_mask)
         return board->core_mask;
+    if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &base, &size) < 0)
+        return board->core_mask;
+    if (size < 0xe01500 + 4) {
+        printf("FDT: GPU: core mask register outside sgx reg (size %#lx); using %#x\n", size,
+               board->core_mask);
+        return board->core_mask;
+    }
     /* Leave the GPU's power state as iBoot left it: the gated G16 handoff on the
      * mini never saw sgx powered up by kboot. */
     int was_active = pmgr_adt_power_is_active("/arm-io/sgx");
