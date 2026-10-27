@@ -563,11 +563,24 @@ static u32 t8132_gpu_core_mask(const struct t8132_gpu_board *board)
     if (adt_path_offset_trace(adt, "/arm-io/sgx", path) < 0 ||
         adt_get_reg(adt, path, "reg", 0, &base, NULL) < 0)
         return board->core_mask;
-    pmgr_adt_power_enable("/arm-io/sgx");
+    /* Leave the GPU's power state as iBoot left it: the gated G16 handoff on the
+     * mini never saw sgx powered up by kboot. */
+    int was_active = pmgr_adt_power_is_active("/arm-io/sgx");
+    if (was_active != 1 && pmgr_adt_power_enable("/arm-io/sgx")) {
+        printf("FDT: GPU: can't power the GPU to read its core mask; using %#x\n", board->core_mask);
+        return board->core_mask;
+    }
     u32 mask = read32(base + 0xe01500) & 0x3ff;
-    printf("FDT: GPU: core mask %#x from the GPU (board default %#x)\n", mask,
-           board->core_mask);
-    return mask ? mask : board->core_mask;
+    if (was_active == 0)
+        pmgr_adt_power_disable("/arm-io/sgx");
+    /* G16 isn't G14X: only trust a value that looks like a fused subset of the board's cores. */
+    u32 cores = 0;
+    for (u32 m = mask; m; m &= m - 1)
+        cores++;
+    bool sane = !(mask & ~board->core_mask) && cores >= 8;
+    printf("FDT: GPU: core mask %#x from the GPU (board default %#x)%s\n", mask, board->core_mask,
+           sane ? "" : "; implausible, using the board default");
+    return sane ? mask : board->core_mask;
 }
 
 static const struct t8132_gpu_board *t8132_gpu_board(void)

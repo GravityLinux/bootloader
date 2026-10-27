@@ -276,6 +276,33 @@ int pmgr_adt_power_disable(const char *path)
     return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, false);
 }
 
+/* 1 if every clock-gate device of the node is active, 0 if any is not, -1 on error. */
+int pmgr_adt_power_is_active(const char *path)
+{
+    const u32 *devices;
+    u32 n_devices;
+
+    if (pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
+        return -1;
+
+    for (u32 i = 0; i < n_devices; ++i) {
+        const struct pmgr_device *device;
+        u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
+        if (pmgr_find_device(id, &device))
+            return -1;
+        if (device->flags & PMGR_FLAG_VIRTUAL)
+            continue;
+        uintptr_t addr = pmgr_device_get_addr(die, device);
+        if (!addr)
+            return -1;
+        if (FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) != PMGR_PS_ACTIVE)
+            return 0;
+    }
+
+    return 1;
+}
+
 int pmgr_adt_power_enable_index(const char *path, u32 index)
 {
     int ret = pmgr_adt_device_set_mode(path, index, PMGR_PS_ACTIVE, true);
