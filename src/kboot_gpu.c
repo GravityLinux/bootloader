@@ -575,22 +575,26 @@ static u32 t8132_gpu_core_mask(const struct t8132_gpu_board *board)
                board->core_mask);
         return board->core_mask;
     }
-    /* Leave the GPU's power state as iBoot left it: the gated G16 handoff on the
-     * mini never saw sgx powered up by kboot. */
+    /* Power sgx and its parent domains before touching its MMIO. Enabling is
+     * recursive and a no-op for domains already on; sgx alone reading active is
+     * not enough (J713 aborted here when power-up was skipped for an sgx that
+     * read active, stage2smoke-air-v4; the earlier unconditional enable read fine).
+     * The domains stay on, as the earlier Air loader left them. */
     int was_active = pmgr_adt_power_is_active("/arm-io/sgx");
-    if (was_active != 1 && pmgr_adt_power_enable("/arm-io/sgx")) {
+    pmgr_adt_power_enable("/arm-io/sgx");
+    if (pmgr_adt_power_is_active("/arm-io/sgx") != 1) {
         printf("FDT: GPU: can't power the GPU to read its core mask; using %#x\n", board->core_mask);
         return board->core_mask;
     }
     u32 mask = read32(base + 0xe01500) & 0x3ff;
-    if (was_active == 0)
-        pmgr_adt_power_disable("/arm-io/sgx");
-    /* G16 isn't G14X: only trust a value that looks like a fused subset of the board's cores. */
+    /* G16 isn't G14X: only trust a value that looks like a fused subset of T8132's
+     * ten cores. The board value is one unit's fusing, not a superset. */
     u32 cores = 0;
     for (u32 m = mask; m; m &= m - 1)
         cores++;
-    bool sane = !(mask & ~board->core_mask) && cores >= 8;
-    printf("FDT: GPU: core mask %#x from the GPU (board default %#x)%s\n", mask, board->core_mask,
+    bool sane = !(mask & ~0x3ffu) && cores >= 8;
+    printf("FDT: GPU: core mask %#x from the GPU (board default %#x, sgx was %s)%s\n", mask,
+           board->core_mask, was_active == 1 ? "on" : was_active == 0 ? "off" : "unknown",
            sane ? "" : "; implausible, using the board default");
     return sane ? mask : board->core_mask;
 }

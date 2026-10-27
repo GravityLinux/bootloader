@@ -276,7 +276,36 @@ int pmgr_adt_power_disable(const char *path)
     return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, false);
 }
 
-/* 1 if every clock-gate device of the node is active, 0 if any is not, -1 on error. */
+static int pmgr_is_active_recursive(u8 die, u16 id)
+{
+    const struct pmgr_device *device;
+
+    if (pmgr_find_device(id, &device))
+        return -1;
+    if (!(device->flags & PMGR_FLAG_VIRTUAL)) {
+        uintptr_t addr = pmgr_device_get_addr(die, device);
+        if (!addr)
+            return -1;
+        if (FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) != PMGR_PS_ACTIVE)
+            return 0;
+    }
+
+    u16 parents[2];
+    pmgr_adt_get_parents(device, parents);
+    for (int i = 0; i < 2; i++) {
+        if (!parents[i])
+            continue;
+        int ret = pmgr_is_active_recursive(die, parents[i]);
+        if (ret != 1)
+            return ret;
+    }
+
+    return 1;
+}
+
+/* 1 if every clock-gate device of the node and all of its parents are active, 0 if
+ * any is not, -1 on error. The parents matter: a device can report active while a
+ * parent domain is gated, and its MMIO then aborts. */
 int pmgr_adt_power_is_active(const char *path)
 {
     const u32 *devices;
@@ -286,18 +315,11 @@ int pmgr_adt_power_is_active(const char *path)
         return -1;
 
     for (u32 i = 0; i < n_devices; ++i) {
-        const struct pmgr_device *device;
         u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
         u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
-        if (pmgr_find_device(id, &device))
-            return -1;
-        if (device->flags & PMGR_FLAG_VIRTUAL)
-            continue;
-        uintptr_t addr = pmgr_device_get_addr(die, device);
-        if (!addr)
-            return -1;
-        if (FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) != PMGR_PS_ACTIVE)
-            return 0;
+        int ret = pmgr_is_active_recursive(die, id);
+        if (ret != 1)
+            return ret;
     }
 
     return 1;
