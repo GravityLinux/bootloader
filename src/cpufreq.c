@@ -8,6 +8,7 @@
 #include "utils.h"
 
 #define CLUSTER_PSTATE 0x20020
+#define CLUSTER_CPM    0x40000
 
 #define CLUSTER_PSTATE_FIXED_FREQ_PLL_RECLOCK BIT(42)
 #define CLUSTER_PSTATE_BUSY                   BIT(31)
@@ -70,6 +71,7 @@ static u32 pstate_reg_to_pstate(u64 val)
         case T6031:
         case T6034:
         case T8122:
+        case T8132:
             return FIELD_GET(CLUSTER_PSTATE_DESIRED1, val);
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
@@ -111,6 +113,7 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             case T6031:
             case T6034:
             case T8122:
+            case T8132:
                 val &= ~CLUSTER_PSTATE_DESIRED1;
                 val |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, pstate);
                 break;
@@ -143,8 +146,10 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
             continue;
 
         u64 reg = cluster->base + features->offset;
+        u32 enabled = pmgr_get_feature(features->name);
+        u64 before = chip_id == T8132 ? read64(reg) : 0;
 
-        if (pmgr_get_feature(features->name))
+        if (enabled)
             mask64(reg, features->clear, features->set);
         else
             mask64(reg, features->set, features->clear);
@@ -153,6 +158,19 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
             printf("cpufreq: Timed out waiting for feature %s on cluster %s\n", features->name,
                    cluster->name);
             return -1;
+        }
+
+        if (chip_id == T8132) {
+            u64 after = read64(reg);
+            u64 mask = features->clear | features->set;
+            u64 expected = enabled ? features->set : features->clear;
+
+            printf("cpufreq: T8132 %s %s=%u @0x%lx: 0x%lx -> 0x%lx\n", cluster->name,
+                   features->name, enabled, reg, before, after);
+            if ((after & mask) != expected) {
+                printf("cpufreq: T8132 %s feature readback mismatch\n", cluster->name);
+                return -1;
+            }
         }
     }
 
@@ -208,6 +226,7 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
         case T6031:
         case T6034:
         case T8122:
+        case T8132:
             /* Unknown */
             write64(cluster->base + 0x440f8, 1);
             break;
@@ -236,6 +255,10 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
     /* Default P-State */
     if (cluster->default_pstate && set_pstate(cluster, cluster->default_pstate))
         return -1;
+
+    if (chip_id == T8132)
+        printf("cpufreq: T8132 %s initialized, base=0x%lx command=0x%lx\n", cluster->name,
+               cluster->base, read64(cluster->base + CLUSTER_PSTATE));
 
     return 0;
 }
@@ -372,6 +395,66 @@ static const struct cluster_t t6030_clusters[] = {
     {},
 };
 
+/* The boot states follow T6030; both J713 and J773g have these ADT OPPs. */
+static struct cluster_t t8132_clusters[] = {
+    {"ECPU0", 0, false, 1, 5},
+    {"PCPU0", 0, true, 1, 6},
+    {},
+};
+
+static const struct cluster_t *cpufreq_get_t8132_clusters(void)
+{
+    int cpus = adt_path_offset(adt, "/cpus");
+    u32 count;
+    u64 bases[2] = {0};
+
+    if (cpus < 0 || ADT_GETPROP(adt, cpus, "cpu-cluster-count", &count) < 0 || count != 2) {
+        printf("cpufreq: Invalid T8132 CPU cluster count\n");
+        return NULL;
+    }
+
+    int node = cpus;
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        u32 id;
+        char type[2];
+        u64 cpm[2];
+
+        /* The CPU nodes carry physical CPM apertures, not arm-io-relative regs. */
+        if (ADT_GETPROP(adt, node, "cluster-id", &id) < 0 || id >= count ||
+            ADT_GETPROP_ARRAY(adt, node, "cluster-type", type) < 0 || type[1] ||
+            type[0] != (id ? 'P' : 'E') || ADT_GETPROP_ARRAY(adt, node, "cpm-impl-reg", cpm) < 0 ||
+            cpm[0] < CLUSTER_CPM || (cpm[0] & 0xffff) || cpm[1] < 0x8410 ||
+            cpm[0] > UINT64_MAX - cpm[1]) {
+            printf("cpufreq: Invalid T8132 CPU cluster aperture\n");
+            return NULL;
+        }
+
+        /*
+         * CPM starts at cluster +0x40000 on the captured J713/J773g ADTs.
+         * This gives the same DVFS base (+0x20000) used by the T8132 Linux DT.
+         * +0x8410 covers the last inherited CPM feature register (+0x8408).
+         */
+        u64 base = cpm[0] - CLUSTER_CPM;
+        if (bases[id] && bases[id] != base) {
+            printf("cpufreq: Inconsistent T8132 cluster %u apertures\n", id);
+            return NULL;
+        }
+        bases[id] = base;
+    }
+
+    if (!bases[0] || !bases[1] || bases[0] == bases[1]) {
+        printf("cpufreq: Missing or overlapping T8132 clusters\n");
+        return NULL;
+    }
+
+    /* Publish only after validating every CPU node, before any cluster writes. */
+    for (u32 i = 0; i < count; i++)
+        t8132_clusters[i].base = bases[i];
+
+    return t8132_clusters;
+}
+
 const struct cluster_t *cpufreq_get_clusters(void)
 {
     switch (chip_id) {
@@ -412,6 +495,8 @@ const struct cluster_t *cpufreq_get_clusters(void)
         case T6031:
         case T6034:
             return t6031_clusters;
+        case T8132:
+            return cpufreq_get_t8132_clusters();
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
             return NULL;
@@ -493,6 +578,23 @@ static const struct feat_t t6030_features[] = {
     {},
 };
 
+/*
+ * T6030's CPU-complex layout is the template for T8132. J713/J773g advertise
+ * cpu-apsc, unlike the T8122 template, so retain the M2/M3 APSC enable handling.
+ * Keep each throttle gate ADT-controlled: the captured M4 ADTs set them to 0.
+ * This does not establish the M4 firmware's thermal thresholds or alarm action.
+ */
+static const struct feat_t t8132_features[] = {
+    {"cpu-apsc", CLUSTER_PSTATE, CLUSTER_PSTATE_M2_APSC_DIS, 0, CLUSTER_PSTATE_APSC_BUSY, false},
+    {"ppt-thrtl", 0x48400, 0, BIT(63), 0, false},
+    {"ppt-thrtl", 0x48408, 0, BIT(63), 0, false},
+    {"llc-thrtl", 0x40270, 0, BIT(63), 0, false},
+    {"amx-thrtl", 0x40250, 0, BIT(63), 0, false},
+    {"cpu-fixed-freq-pll-relock", CLUSTER_PSTATE, 0, CLUSTER_PSTATE_FIXED_FREQ_PLL_RECLOCK, 0,
+     false},
+    {},
+};
+
 const struct feat_t *cpufreq_get_features(void)
 {
     switch (chip_id) {
@@ -527,6 +629,8 @@ const struct feat_t *cpufreq_get_features(void)
         case T6031:
         case T6034:
             return t6030_features;
+        case T8132:
+            return t8132_features;
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
             return NULL;
@@ -551,6 +655,9 @@ int cpufreq_init(void)
     while (cluster->base) {
         err |= cpufreq_init_cluster(cluster++, features);
     }
+
+    if (chip_id == T8132)
+        printf("cpufreq: T8132 initialization %s\n", err ? "FAILED" : "complete");
 
     return err ? -1 : 0;
 }
