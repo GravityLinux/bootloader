@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include <string.h>
+
 #include "cpufreq.h"
 #include "adt.h"
 #include "firmware.h"
@@ -145,8 +147,17 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
         if (features->pcluster_only && !cluster->pcluster)
             continue;
 
-        u64 reg = cluster->base + features->offset;
         u32 enabled = pmgr_get_feature(features->name);
+        /* Disabled T8132 throttle gates can fault even on a diagnostic read. */
+        if (chip_id == T8132 && !enabled &&
+            (!strcmp(features->name, "ppt-thrtl") || !strcmp(features->name, "llc-thrtl") ||
+             !strcmp(features->name, "amx-thrtl"))) {
+            printf("cpufreq: T8132 %s %s=0 skipped (ADT disabled; no MMIO)\n", cluster->name,
+                   features->name);
+            continue;
+        }
+
+        u64 reg = cluster->base + features->offset;
         u64 before = chip_id == T8132 ? read64(reg) : 0;
 
         if (enabled)
@@ -581,7 +592,8 @@ static const struct feat_t t6030_features[] = {
 /*
  * T6030's CPU-complex layout is the template for T8132. J713/J773g advertise
  * cpu-apsc, unlike the T8122 template, so retain the M2/M3 APSC enable handling.
- * Keep each throttle gate ADT-controlled: the captured M4 ADTs set them to 0.
+ * Access throttle gates only when ADT-enabled: disabled P-cluster PPT access
+ * faults on J713, even though the corresponding E-cluster access completes.
  * This does not establish the M4 firmware's thermal thresholds or alarm action.
  */
 static const struct feat_t t8132_features[] = {

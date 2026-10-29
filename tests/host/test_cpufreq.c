@@ -26,7 +26,9 @@ static struct {
     char type[2];
     u64 cpm[2];
 } cpus[10];
-static u32 cluster_count, child_count, throttle;
+static u32 cluster_count, child_count, ppt_throttle, llc_throttle, amx_throttle;
+static unsigned int gate_accesses[2][4];
+static const u64 gate_offsets[] = {0x40250, 0x40270, 0x48400, 0x48408};
 static int missing_node;
 static const char *missing_property;
 static bool timeout_poll, drop_feature_write;
@@ -46,12 +48,31 @@ static u64 *reg(u64 addr)
     return &regs[nregs++].value;
 }
 
+static void check_access(u64 addr)
+{
+    if (chip_id != T8132)
+        return;
+
+    unsigned int cluster = addr >= 0x211e00000;
+    u64 base = cluster ? 0x211e00000 : 0x210e00000;
+    u32 enabled[] = {amx_throttle, llc_throttle, ppt_throttle, ppt_throttle};
+    for (unsigned int i = 0; i < 4; i++) {
+        if (addr != base + gate_offsets[i])
+            continue;
+        /* This includes diagnostic reads, read/modify/write and polling. */
+        assert(enabled[i] && "disabled T8132 throttle gate accessed");
+        gate_accesses[cluster][i]++;
+    }
+}
+
 static u64 read64(u64 addr)
 {
+    check_access(addr);
     return *reg(addr);
 }
 static void write64(u64 addr, u64 value)
 {
+    check_access(addr);
     /* Independent whitelist: no snooze, LUT, PMP SRAM or voltage writes. */
     u64 base = addr >= 0x211e00000 ? 0x211e00000 : 0x210e00000;
     u64 offset = addr - base;
@@ -155,8 +176,12 @@ u32 pmgr_get_feature(const char *name)
 {
     if (!strcmp(name, "cpu-apsc"))
         return 1;
-    if (strstr(name, "thrtl"))
-        return throttle;
+    if (!strcmp(name, "ppt-thrtl"))
+        return ppt_throttle;
+    if (!strcmp(name, "llc-thrtl"))
+        return llc_throttle;
+    if (!strcmp(name, "amx-thrtl"))
+        return amx_throttle;
     return 0;
 }
 int pmgr_power_on(int die, const char *name)
@@ -170,7 +195,8 @@ int pmgr_power_on(int die, const char *name)
 static void reset(void)
 {
     chip_id = T8132;
-    nregs = writes = throttle = 0;
+    nregs = writes = ppt_throttle = llc_throttle = amx_throttle = 0;
+    memset(gate_accesses, 0, sizeof(gate_accesses));
     cluster_count = 2;
     child_count = 10;
     missing_node = -1;
@@ -185,9 +211,8 @@ static void reset(void)
     }
     for (u64 base = 0x210e00000; base <= 0x211e00000; base += 0x1000000) {
         *reg(base + 0x20020) = BIT(48) | BIT(42) | BIT(23) | 18;
-        u64 offsets[] = {0x40250, 0x40270, 0x48400, 0x48408};
         for (unsigned int i = 0; i < 4; i++)
-            *reg(base + offsets[i]) = BIT(63) | 0x12345678;
+            *reg(base + gate_offsets[i]) = BIT(63) | 0x12345678;
     }
 }
 
@@ -205,15 +230,33 @@ int main(void)
         u64 command = read64(base + 0x20020);
         assert(command == (BIT(48) | BIT(25) | (base == 0x210e00000 ? 5 : 6)));
         assert(read64(base + 0x440f8) == 1);
-        u64 offsets[] = {0x40250, 0x40270, 0x48400, 0x48408};
-        for (unsigned int i = 0; i < 4; i++)
-            assert(read64(base + offsets[i]) == 0x12345678);
+        for (unsigned int i = 0; i < 4; i++) {
+            /* Inspect model storage without simulating a forbidden MMIO read. */
+            assert(*reg(base + gate_offsets[i]) == (BIT(63) | 0x12345678));
+            assert(gate_accesses[base == 0x211e00000][i] == 0);
+        }
     }
-    reset();
-    throttle = 1;
-    assert(cpufreq_init() == 0);
-    assert(read64(0x210e48400) & BIT(63));
-    assert(read64(0x211e48408) & BIT(63));
+    /* Check each gate independently, including all mixed enable combinations. */
+    for (unsigned int enabled_mask = 1; enabled_mask < 8; enabled_mask++) {
+        reset();
+        ppt_throttle = !!(enabled_mask & 1);
+        llc_throttle = !!(enabled_mask & 2);
+        amx_throttle = !!(enabled_mask & 4);
+        for (unsigned int cluster = 0; cluster < 2; cluster++) {
+            u64 base = cluster ? 0x211e00000 : 0x210e00000;
+            for (unsigned int i = 0; i < 4; i++)
+                *reg(base + gate_offsets[i]) = 0x12345678;
+        }
+        assert(cpufreq_init() == 0);
+        u32 enabled[] = {amx_throttle, llc_throttle, ppt_throttle, ppt_throttle};
+        for (unsigned int cluster = 0; cluster < 2; cluster++) {
+            u64 base = cluster ? 0x211e00000 : 0x210e00000;
+            for (unsigned int i = 0; i < 4; i++) {
+                assert(*reg(base + gate_offsets[i]) == (0x12345678 | (enabled[i] ? BIT(63) : 0)));
+                assert((gate_accesses[cluster][i] != 0) == !!enabled[i]);
+            }
+        }
+    }
     const char *keys[] = {"cluster-id", "cluster-type", "cpm-impl-reg"};
     for (unsigned int i = 0; i < 3; i++) {
         reset();
@@ -253,13 +296,16 @@ int main(void)
     timeout_poll = true;
     assert(cpufreq_init() < 0);
     reset();
+    ppt_throttle = 1;
+    *reg(0x210e48400) &= ~BIT(63);
+    *reg(0x211e48400) &= ~BIT(63);
     drop_feature_write = true;
     assert(cpufreq_init() < 0);
     reset();
     chip_id = T8122;
     assert(cpufreq_get_clusters() == t6030_clusters);
     assert(cpufreq_get_features() == t8122_features);
-    puts("PASS: T8132 ADT mapping, failure-before-write, register preservation, feature polarity, "
-         "failures, legacy dispatch");
+    puts("PASS: T8132 ADT mapping, failure-before-write, register preservation, disabled-gate "
+         "access rejection, mixed feature enables, failures, legacy dispatch");
     return 0;
 }
