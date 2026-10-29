@@ -9,8 +9,9 @@
 #include "soc.h"
 #include "utils.h"
 
-#define CLUSTER_PSTATE 0x20020
-#define CLUSTER_CPM    0x40000
+#define CLUSTER_PSTATE        0x20020
+#define CLUSTER_PSTATE_STATUS 0x20050
+#define CLUSTER_CPM           0x40000
 
 #define CLUSTER_PSTATE_FIXED_FREQ_PLL_RECLOCK BIT(42)
 #define CLUSTER_PSTATE_BUSY                   BIT(31)
@@ -23,6 +24,9 @@
 #define CLUSTER_PSTATE_APSC_BUSY              BIT(7)
 #define CLUSTER_PSTATE_DESIRED1               GENMASK(4, 0)
 #define CLUSTER_PSTATE_DESIRED1_S5L8960X      GENMASK(24, 22)
+
+#define CLUSTER_PSTATE_STATUS_CURRENT_T8132 GENMASK(9, 5)
+#define CLUSTER_PSTATE_STATUS_TARGET_T8132  GENMASK(4, 0)
 
 #define PMGR_VOLTAGE_CTL_OFF_S5L8960X 0x20c00
 #define PMGR_VOLTAGE_CTL_OFF_T7000    0x23000
@@ -81,8 +85,49 @@ static u32 pstate_reg_to_pstate(u64 val)
     }
 }
 
+static int set_pstate_t8132(const struct cluster_t *cluster, uint32_t pstate)
+{
+    u64 command = cluster->base + CLUSTER_PSTATE;
+    u64 status = cluster->base + CLUSTER_PSTATE_STATUS;
+    u64 value;
+
+    /*
+     * T8132 uses Linux apple-soc-cpufreq's T8112 layout: DVFS +0x20 is
+     * the 64-bit command, +0x50 is 32-bit status. Wait for command bit 31
+     * BEFORE submitting a request; current status need not reach the request.
+     */
+    printf("cpufreq: T8132 %s request P%u: poll64 @0x%lx bit31=0 before write "
+           "(2us, %uus); status32 @0x%lx\n",
+           cluster->name, pstate, command, CLUSTER_SWITCH_TIMEOUT, status);
+    for (u32 elapsed = 0;; elapsed += 2) {
+        value = read64(command);
+        if (!(value & CLUSTER_PSTATE_BUSY))
+            break;
+        if (elapsed == CLUSTER_SWITCH_TIMEOUT) {
+            printf("cpufreq: T8132 %s command busy timeout @0x%lx\n", cluster->name, command);
+            return -1;
+        }
+        udelay(2);
+    }
+
+    value &= ~CLUSTER_PSTATE_DESIRED1;
+    value |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, pstate);
+    printf("cpufreq: T8132 %s write command @0x%lx = 0x%lx\n", cluster->name, command, value);
+    write64(command, value);
+
+    /* Observe once; Linux does not wait for actual frequency after the write. */
+    u32 observed = read32(status);
+    printf("cpufreq: T8132 %s status32 @0x%lx = 0x%x (current P%u target P%u)\n", cluster->name,
+           status, observed, (u32)FIELD_GET(CLUSTER_PSTATE_STATUS_CURRENT_T8132, observed),
+           (u32)FIELD_GET(CLUSTER_PSTATE_STATUS_TARGET_T8132, observed));
+    return 0;
+}
+
 static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
 {
+    if (chip_id == T8132)
+        return set_pstate_t8132(cluster, pstate);
+
     u64 val = read64(cluster->base + CLUSTER_PSTATE);
 
     if (pstate_reg_to_pstate(val) != pstate) {
@@ -115,7 +160,6 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             case T6031:
             case T6034:
             case T8122:
-            case T8132:
                 val &= ~CLUSTER_PSTATE_DESIRED1;
                 val |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, pstate);
                 break;
@@ -237,9 +281,11 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
         case T6031:
         case T6034:
         case T8122:
-        case T8132:
             /* Unknown */
             write64(cluster->base + 0x440f8, 1);
+            break;
+        case T8132:
+            /* No ADT feature justifies the older SoCs' unknown +0x440f8 write. */
             break;
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);

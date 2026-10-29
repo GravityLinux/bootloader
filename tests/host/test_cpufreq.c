@@ -11,6 +11,8 @@
 #define UTILS_H
 u32 chip_id;
 static u64 read64(u64 addr);
+static u32 read32(u64 addr);
+static void udelay(u32 usec);
 static void write64(u64 addr, u64 value);
 static void write32(u64 addr, u32 value);
 static u64 mask64(u64 addr, u64 clear, u64 set);
@@ -32,10 +34,26 @@ static const u64 gate_offsets[] = {0x40250, 0x40270, 0x48400, 0x48408};
 static int missing_node;
 static const char *missing_property;
 static bool timeout_poll, drop_feature_write;
+static bool command_stuck;
+static unsigned int command_busy_reads[2];
+enum access_type { READ64, READ32, WRITE64, DELAY };
+static struct {
+    enum access_type type;
+    u64 addr, value;
+} accesses[4096];
+static unsigned int naccesses;
 static struct {
     u64 addr, value;
 } regs[64];
 static unsigned int nregs, writes;
+
+static void record(enum access_type type, u64 addr, u64 value)
+{
+    assert(naccesses < 4096);
+    accesses[naccesses].type = type;
+    accesses[naccesses].addr = addr;
+    accesses[naccesses++].value = value;
+}
 
 static u64 *reg(u64 addr)
 {
@@ -55,6 +73,7 @@ static void check_access(u64 addr)
 
     unsigned int cluster = addr >= 0x211e00000;
     u64 base = cluster ? 0x211e00000 : 0x210e00000;
+    assert(addr != base + 0x440f8 && "unexplained T8132 CPM register accessed");
     u32 enabled[] = {amx_throttle, llc_throttle, ppt_throttle, ppt_throttle};
     for (unsigned int i = 0; i < 4; i++) {
         if (addr != base + gate_offsets[i])
@@ -68,7 +87,27 @@ static void check_access(u64 addr)
 static u64 read64(u64 addr)
 {
     check_access(addr);
+    assert(addr != 0x210e20050 && addr != 0x211e20050);
+    u64 value = *reg(addr);
+    if (chip_id == T8132 && (addr == 0x210e20020 || addr == 0x211e20020)) {
+        unsigned int cluster = addr == 0x211e20020;
+        if (command_stuck || command_busy_reads[cluster])
+            value |= BIT(31);
+        if (command_busy_reads[cluster])
+            command_busy_reads[cluster]--;
+    }
+    record(READ64, addr, value);
+    return value;
+}
+static u32 read32(u64 addr)
+{
+    assert(addr == 0x210e20050 || addr == 0x211e20050);
+    record(READ32, addr, (u32)*reg(addr));
     return *reg(addr);
+}
+static void udelay(u32 usec)
+{
+    record(DELAY, 0, usec);
 }
 static void write64(u64 addr, u64 value)
 {
@@ -78,6 +117,7 @@ static void write64(u64 addr, u64 value)
     u64 offset = addr - base;
     assert(offset == 0x20020 || offset == 0x40250 || offset == 0x40270 || offset == 0x440f8 ||
            offset == 0x48400 || offset == 0x48408);
+    record(WRITE64, addr, value);
     writes++;
     if (!(drop_feature_write && offset == 0x48400))
         *reg(addr) = value;
@@ -196,6 +236,9 @@ static void reset(void)
 {
     chip_id = T8132;
     nregs = writes = ppt_throttle = llc_throttle = amx_throttle = 0;
+    naccesses = 0;
+    command_stuck = false;
+    memset(command_busy_reads, 0, sizeof(command_busy_reads));
     memset(gate_accesses, 0, sizeof(gate_accesses));
     cluster_count = 2;
     child_count = 10;
@@ -211,6 +254,8 @@ static void reset(void)
     }
     for (u64 base = 0x210e00000; base <= 0x211e00000; base += 0x1000000) {
         *reg(base + 0x20020) = BIT(48) | BIT(42) | BIT(23) | 18;
+        /* Actual/target deliberately differ from requests; status is not polled. */
+        *reg(base + 0x20050) = BIT(31) | (3 << 5) | 7;
         for (unsigned int i = 0; i < 4; i++)
             *reg(base + gate_offsets[i]) = BIT(63) | 0x12345678;
     }
@@ -222,14 +267,60 @@ static void reject(void)
     assert(writes == 0);
 }
 
+static void test_t8132_transition(void)
+{
+    for (unsigned int cluster = 0; cluster < 2; cluster++) {
+        reset();
+        const struct cluster_t *c = &cpufreq_get_clusters()[cluster];
+        u64 command = cluster ? 0x211e20020 : 0x210e20020;
+        u64 status = cluster ? 0x211e20050 : 0x210e20050;
+        u64 expected = (*reg(command) & ~0x1f) | BIT(25) | 6;
+        command_busy_reads[cluster] = 2;
+        assert(set_pstate(c, 6) == 0);
+        /* Two busy samples, then readiness, one request, one 32-bit observation. */
+        assert(naccesses == 7);
+        for (unsigned int i = 0; i <= 4; i += 2) {
+            assert(accesses[i].type == READ64 && accesses[i].addr == command);
+            assert(!!(accesses[i].value & BIT(31)) == (i < 4));
+        }
+        assert(accesses[1].type == DELAY && accesses[1].value == 2);
+        assert(accesses[3].type == DELAY && accesses[3].value == 2);
+        assert(accesses[5].type == WRITE64 && accesses[5].addr == command);
+        assert(accesses[5].value == expected);
+        assert(accesses[6].type == READ32 && accesses[6].addr == status);
+        assert(accesses[6].value == (BIT(31) | (3 << 5) | 7));
+        assert(writes == 1);
+
+        /* Linux also submits an already-requested state, after checking busy. */
+        naccesses = 0;
+        assert(set_pstate(c, 6) == 0);
+        assert(naccesses == 3);
+        assert(accesses[0].type == READ64 && accesses[0].addr == command);
+        assert(accesses[1].type == WRITE64 && accesses[1].addr == command);
+        assert(accesses[2].type == READ32 && accesses[2].addr == status);
+
+        reset();
+        command_stuck = true;
+        assert(set_pstate(c, 6) < 0);
+        assert(writes == 0 && naccesses == 401);
+        for (unsigned int i = 0; i < naccesses; i++) {
+            if (i & 1)
+                assert(accesses[i].type == DELAY && accesses[i].value == 2);
+            else
+                assert(accesses[i].type == READ64 && accesses[i].addr == command);
+        }
+    }
+}
+
 int main(void)
 {
+    test_t8132_transition();
     reset();
     assert(cpufreq_init() == 0);
     for (u64 base = 0x210e00000; base <= 0x211e00000; base += 0x1000000) {
         u64 command = read64(base + 0x20020);
         assert(command == (BIT(48) | BIT(25) | (base == 0x210e00000 ? 5 : 6)));
-        assert(read64(base + 0x440f8) == 1);
+        assert(*reg(base + 0x440f8) == 0);
         for (unsigned int i = 0; i < 4; i++) {
             /* Inspect model storage without simulating a forbidden MMIO read. */
             assert(*reg(base + gate_offsets[i]) == (BIT(63) | 0x12345678));
@@ -305,7 +396,8 @@ int main(void)
     chip_id = T8122;
     assert(cpufreq_get_clusters() == t6030_clusters);
     assert(cpufreq_get_features() == t8122_features);
-    puts("PASS: T8132 ADT mapping, failure-before-write, register preservation, disabled-gate "
-         "access rejection, mixed feature enables, failures, legacy dispatch");
+    puts("PASS: T8132 ADT mapping, pre-write command polling, 32-bit status, busy timeout, "
+         "failure-before-write, register preservation, forbidden CPM access rejection, "
+         "mixed feature enables, failures, legacy dispatch");
     return 0;
 }
