@@ -388,6 +388,26 @@ static int dt_set_memory(void)
             bail("FDT: Could not reserve CTRR range\n");
     }
 
+    // On t8142 a second CTRR instance covers the DeviceTree/TrustCache area below m1n1, and Linux
+    // faults the same way if it hands those pages to a secondary CPU. Only reserve it where it is
+    // known to be populated; the instance reads back zero when it is not in use.
+    if (chip_id == T8142) {
+        u64 d_lower = mrs(SYS_IMP_APL_CTRR_D_LOWER_EL1);
+        u64 d_upper = mrs(SYS_IMP_APL_CTRR_D_UPPER_EL1);
+
+        if (d_lower && d_upper >= d_lower) {
+            u64 d_start = ALIGN_DOWN(d_lower, get_page_size());
+            u64 d_end = ALIGN_UP(d_upper + SZ_4K, get_page_size());
+
+            if (d_start < dram_min || d_end <= d_start || d_end > dram_max)
+                bail("FDT: Invalid CTRR D range 0x%lx..0x%lx\n", d_start, d_end);
+
+            printf("FDT: Reserving CTRR D range 0x%lx..0x%lx\n", d_start, d_end);
+            if (fdt_add_mem_rsv(dt, d_start, d_end - d_start))
+                bail("FDT: Could not reserve CTRR D range\n");
+        }
+    }
+
     printf("FDT: DRAM at 0x%lx size 0x%lx\n", dram_base, dram_size);
     printf("FDT: Usable memory is 0x%lx..0x%lx (0x%lx)\n", dram_min, dram_max, dram_max - dram_min);
 
