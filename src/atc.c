@@ -127,17 +127,17 @@ int atc_get_tunables(int adt_node, const struct atc_tunable_info *info,
     return count;
 }
 
-static int atc_apply_common_tunables(int adt_node, uintptr_t core,
-                                     const struct atc_tunable_info *info, size_t count)
+static int atc_apply_tunables(int adt_node, uintptr_t core,
+                            const struct atc_tunable_info *info, size_t count,
+                            const char *group)
 {
     for (size_t i = 0; i < count; i++) {
-        if (strcmp(info[i].fdt_name, "apple,tunable-common-b"))
+        if (strcmp(info[i].fdt_name, group))
             continue;
 
         const struct atc_tunable *tunables;
         int n = atc_get_tunables(adt_node, &info[i], &tunables);
-        /* PHY startup requires every common table to be present and nonempty. */
-        if (n <= 0)
+        if (n < 0 || (n == 0 && info[i].required))
             return -1;
         for (int j = 0; j < n; j++)
             mask32(core + info[i].reg_offset + tunables[j].offset, tunables[j].mask,
@@ -161,8 +161,12 @@ int atc_usb3_init_t8122(int adt_node, uintptr_t core)
     set32(core + ATCPHY_POWER_CTRL, ATCPHY_POWER_APB_RESET_N);
 
     bool swapped = read32(core + ATCPHY_MISC) & ATCPHY_MISC_LANE_SWAP;
-    if (atc_apply_common_tunables(adt_node, core, atc_tunables_t8122, atc_tunables_t8122_count) <
-        0) {
+    /* Calibrate the USB lane selected by cable orientation before releasing
+     * PHY reset. T8122 does not use DP lane tunables in USB3 mode. */
+    if (atc_apply_tunables(adt_node, core, atc_tunables_t8122, atc_tunables_t8122_count,
+                          "apple,tunable-common-b") < 0 ||
+        atc_apply_tunables(adt_node, core, atc_tunables_t8122, atc_tunables_t8122_count,
+                          swapped ? "apple,tunable-lane1-usb" : "apple,tunable-lane0-usb") < 0) {
         printf("ATC: tunables failed\n");
         return -1;
     }
