@@ -48,6 +48,11 @@ struct usb_drd_regs {
 static tps6598x_irq_state_t tps6598x_irq_state[USB_IODEV_COUNT];
 static bool usb_is_initialized = false;
 
+#define USB2PHY_CTL             0x04
+#define USB2PHY_CTL_RESET       BIT(0)
+#define USB2PHY_CTL_PORT_RESET  BIT(1)
+#define USB2PHY_CTL_APB_RESET_N BIT(2)
+
 #define PIPEHANDLER_MUX_CTRL             0x0c
 #define PIPEHANDLER_MUX_CTRL_USB3        0x08
 #define PIPEHANDLER_MUX_CTRL_USB4_TUNNEL 0x11
@@ -168,8 +173,14 @@ int usb_phy_bringup(u32 idx)
         return -1;
 
     write32(usb_regs.atc + 0x08, 0x01c1000f);
-    write32(usb_regs.atc + 0x04, 0x00000003);
-    write32(usb_regs.atc + 0x04, chip_id == T8140 ? BIT(2) : 0); /* APB_RESET_N */
+    write32(usb_regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET);
+    if (chip_id == T8140) {
+        clear32(usb_regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET);
+        clear32(usb_regs.atc + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
+        set32(usb_regs.atc + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    } else {
+        write32(usb_regs.atc + USB2PHY_CTL, 0);
+    }
     write32(usb_regs.atc + 0x1c, 0x008c0813);
     write32(usb_regs.atc + 0x00, 0x00000002);
 
