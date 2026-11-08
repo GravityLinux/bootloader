@@ -42,6 +42,7 @@ u64 isp_iova_base(void)
     switch (chip_id) {
         case 0x6020 ... 0x6fff:
         case 0x8122:
+        case T8132:
             return 0x10000000000;
         default:
             return 0;
@@ -66,6 +67,18 @@ int isp_init(void)
     }
     if (node < 0)
         return 0;
+
+    /*
+     * T8132 (M4) has the M4 Max's H16 ISP and runs the same macOS 26.6.2
+     * firmware, whose shared allocations start at 32 MiB (the M4 Max value);
+     * the J713 preloaded segments end at 0x13ec000. Leave the ISP in its
+     * iBoot state, as for the M4 Max: the ADT power-gates also switch the
+     * sensor domains, and the H16 version register is not known.
+     */
+    if (chip_id == T8132) {
+        heap_top = 0x2000000;
+        goto setup_heap;
+    }
 
     if (pmgr_adt_power_enable(isp_path) < 0)
         return -1;
@@ -170,13 +183,22 @@ int isp_init(void)
             return -1;
     }
 
+setup_heap:;
     const struct adt_segment_ranges *seg;
     u32 segments_len;
 
     seg = adt_getprop(adt, isp_node, "segment-ranges", &segments_len);
+    if (!seg || segments_len < 2 * sizeof(*seg) || segments_len % sizeof(*seg)) {
+        printf("isp: bad segment-ranges\n");
+        return -1;
+    }
     unsigned int count = segments_len / sizeof(*seg);
 
     heap_iova = seg[count - 1].iova + seg[count - 1].size;
+    if (heap_iova >= heap_top) {
+        printf("isp: firmware segments end above the heap top\n");
+        return -1;
+    }
     heap_size = heap_top - heap_iova;
     heap_phys = top_of_memory_alloc(heap_size);
 
@@ -188,6 +210,7 @@ int isp_init(void)
 
     isp_initialized = true;
 
-    pmgr_adt_power_disable(isp_path);
+    if (chip_id != T8132)
+        pmgr_adt_power_disable(isp_path);
     return err;
 }
