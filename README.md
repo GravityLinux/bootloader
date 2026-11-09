@@ -1,4 +1,4 @@
-# Gravity Bootloader
+# Graviton: The Foundation of Gravity Linux
 
 Bootloader and hypervisor for Apple Silicon.
 
