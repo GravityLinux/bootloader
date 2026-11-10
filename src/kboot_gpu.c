@@ -524,7 +524,7 @@ struct t8132_gpu_board {
     u32 max_power_mw;
     u32 core_mask;
     /* Read the enabled cores from the GPU: binned parts differ per unit. Only for boards
-     * where that read is validated; on the mini (J773g) it data-aborts (stage2smoke-mini-v1). */
+     * where that read is validated; on the mini (J773g) it data-aborts. */
     bool read_core_mask;
 };
 
@@ -539,19 +539,18 @@ static const struct t8132_gpu_board t8132_gpu_boards[] = {
         .read_core_mask = false,
     },
     {
-        /* MacBook Air 13" (M4). DERIVED, NOT CAPTURED: the ladder comes
-         * from this board's ADT; the curves are the mini's observed values
-         * at the same frequency steps, renormalized to this board's top
-         * step (B[4] interpolated: 836 MHz has no mini step); the limit is
-         * the ADT's clpc pkg-power-limit-spl-gpu-c0. See tmp/air-bringup
-         * FINDINGS.md. The core mask is read from the GPU at boot; the
-         * value here is only the fallback (cores 1 and 6 fused off on the
-         * first unit). */
+        /* MacBook Air 13" (M4). Observed on this board, like the mini's
+         * row: the curves and the limit are the values macOS gives the GPU
+         * firmware in its init data, read from GPU memory with macOS running
+         * as a guest. The frequency and voltage ladder in that init data
+         * matches this board's ADT. The core mask is read from the GPU at
+         * boot; the value here is only the fallback (cores 1 and 6 fused off
+         * on the first unit, which is also the mask macOS reports there). */
         .target = "J713",
         .groups = 10,
-        .pwr_calib_a = {0, 10, 18, 27, 34, 46, 56, 68, 76, 100},
-        .pwr_calib_b = {0, 0, 0, 0, 6, 38, 55, 71, 80, 100},
-        .max_power_mw = 15827,
+        .pwr_calib_a = {0, 12, 22, 31, 42, 55, 69, 82, 92, 100},
+        .pwr_calib_b = {0, 0, 24, 40, 52, 63, 73, 83, 88, 100},
+        .max_power_mw = 26250,
         .core_mask = 0x3bd,
         .read_core_mask = true,
     },
@@ -578,7 +577,7 @@ static u32 t8132_gpu_core_mask(const struct t8132_gpu_board *board)
     /* Power sgx and its parent domains before touching its MMIO. Enabling is
      * recursive and a no-op for domains already on; sgx alone reading active is
      * not enough (J713 aborted here when power-up was skipped for an sgx that
-     * read active, stage2smoke-air-v4; the earlier unconditional enable read fine).
+     * read active; the earlier unconditional enable read fine).
      * The domains stay on, as the earlier Air loader left them. */
     int was_active = pmgr_adt_power_is_active("/arm-io/sgx");
     pmgr_adt_power_enable("/arm-io/sgx");
