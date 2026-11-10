@@ -822,3 +822,5 @@
 /* 48kb read only region given to us by iBoot */
 #define SYS_IMP_APL_CTRR_LOWER_EL1 sys_reg(3, 0, 11, 0, 0)
 #define SYS_IMP_APL_CTRR_UPPER_EL1 sys_reg(3, 0, 11, 0, 1)
+#define SYS_IMP_APL_CTRR_D_LOWER_EL1 sys_reg(3, 0, 11, 0, 2)
+#define SYS_IMP_APL_CTRR_D_UPPER_EL1 sys_reg(3, 0, 11, 0, 3)
