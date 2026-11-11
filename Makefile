@@ -253,17 +253,16 @@ build/%.o: src/%.c build-tag build-cfg
 invoke_cc:
 	$(QUIET)$(CC) -c $(CFLAGS) -Isrc -o $(OBJFILE) $(CFILE)
 
-build/$(NAME).elf: $(BUILD_ALL_OBJS) m1n1.ld
+build/$(NAME).elf: $(BUILD_ALL_OBJS) m1n1-raw.ld
 	$(QUIET)echo "  LD    $@"
-	$(QUIET)$(LD) -T m1n1.ld $(LDFLAGS) -o $@ $(BUILD_ALL_OBJS)
-
-build/$(NAME)-raw.elf: $(BUILD_ALL_OBJS) m1n1-raw.ld
-	$(QUIET)echo "  LDRAW $@"
 	$(QUIET)$(LD) -T m1n1-raw.ld $(LDFLAGS) -o $@ $(BUILD_ALL_OBJS)
 
-build/$(NAME).macho: build/$(NAME).elf
+build/$(NAME)-raw.elf: build/$(NAME).elf
+	$(QUIET)cp $< $@
+
+build/$(NAME).macho: build/$(NAME).bin tools/macho.py
 	$(QUIET)echo "  MACHO $@"
-	$(QUIET)$(OBJCOPY) -O binary --strip-debug $< $@
+	$(QUIET)python3 tools/macho.py $< $@
 
 ifeq ($(LOGO),)
 build/$(NAME).bin: build/$(NAME)-raw.elf
