@@ -1021,6 +1021,9 @@ static int dt_set_wifi(void)
 {
     int anode = adt_path_offset(adt, "/arm-io/wlan");
 
+    if (anode < 0)
+        anode = adt_path_offset(adt, "/arm-io/centauri");
+
     if (anode < 0) {
         /*
          * t8012-based system does not have wifi, and on some other
@@ -1042,21 +1045,35 @@ static int dt_set_wifi(void)
     if (node < 0)
         return 0;
 
-    char antenna[8];
-    memcpy(antenna, &info[8], sizeof(antenna));
+    char antenna[9] = {0};
+    memcpy(antenna, &info[8], 8);
     fdt_setprop_string(dt, node, "apple,antenna-sku", antenna);
 
     u32 len;
     const u8 *cal_blob = adt_getprop(adt, anode, "wifi-calibration-msf", &len);
 
     if (!cal_blob || !len) {
-        printf("ADT: Failed to get wifi-calibration-msf. Replaced module?\n");
         return 0;
     }
 
     fdt_setprop(dt, node, "brcm,cal-blob", cal_blob, len);
 
     return 0;
+}
+
+/* The control function consumes the host's manifest identity; Linux owns
+ * firmware loading, endpoint reset, DMA state and radio initialization. */
+static int dt_set_centauri(void)
+{
+    int node = fdt_path_offset(dt, "wifi-control");
+    if (node < 0 || adt_path_offset(adt, "/arm-io/centauri") < 0)
+        return 0;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u32 board, chip;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "board-id", &board) < 0 ||
+        ADT_GETPROP(adt, chosen, "chip-id", &chip) < 0 || board > UINT16_MAX || chip > UINT16_MAX)
+        bail("ADT: invalid host identity for Centauri\n");
+    return fdt_setprop_u32(dt, node, "apple,host-platform-id", (board << 16) | chip);
 }
 
 static void dt_set_uboot_dm_preloc(int node)
@@ -2973,6 +2990,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_mac_addresses())
         return -1;
     if (dt_set_wifi())
+        return -1;
+    if (dt_set_centauri())
         return -1;
     if (dt_set_bluetooth())
         return -1;
