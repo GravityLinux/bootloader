@@ -853,6 +853,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             }
             return true;
         /* pass through PMU handling */
+        SYSREG_PASS(SYS_IMP_APL_UPMCR0)
         SYSREG_PASS(SYS_IMP_APL_PMCR1)
         SYSREG_PASS(SYS_IMP_APL_PMCR2)
         SYSREG_PASS(SYS_IMP_APL_PMCR3)
@@ -872,6 +873,12 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         SYSREG_PASS(SYS_IMP_APL_PMC7)
         SYSREG_PASS(SYS_IMP_APL_PMC8)
         SYSREG_PASS(SYS_IMP_APL_PMC9)
+
+        /* Keep the normal Python passthrough behavior local for frequent MTE accesses. */
+        SYSREG_PASS(sys_reg(3, 0, 1, 0, 5)) // RGSR_EL1
+        SYSREG_PASS(sys_reg(3, 0, 1, 0, 6)) // GCR_EL1
+        SYSREG_PASS(sys_reg(3, 0, 5, 6, 0)) // TFSR_EL1
+        SYSREG_PASS(sys_reg(3, 0, 5, 6, 1)) // TFSRE0_EL1
 
         /* Outer Sharable TLB maintenance instructions */
         SYSREG_PASS(sys_reg(1, 0, 8, 1, 0)) // TLBI VMALLE1OS
