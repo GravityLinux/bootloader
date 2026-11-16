@@ -258,10 +258,12 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
     free(dcp->phy);
     afk_epic_shutdown(dcp->afk);
     if (sleep) {
-        rtkit_sleep(dcp->rtkit);
+        if (!rtkit_sleep(dcp->rtkit))
+            return -1;
         pmgr_reset(dcp_die, dcp_pmgr_dev);
     } else {
-        rtkit_quiesce(dcp->rtkit);
+        if (!rtkit_quiesce(dcp->rtkit))
+            return -1;
     }
     rtkit_free(dcp->rtkit);
     dart_shutdown(dcp->dart_disp);

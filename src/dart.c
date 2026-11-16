@@ -117,6 +117,7 @@ struct dart_dev {
     enum dart_type_t type;
     const struct dart_params *params;
     u64 vm_base;
+    u64 dva_base;
 
     u64 *l1[DART_MAX_TTBR_COUNT];
 };
@@ -335,8 +336,12 @@ dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_
             printf("dart: unexpected length of vm-base property: %u\n", len);
         }
     }
-    if (dart->locked)
+    if (dart->locked) {
+        /* Preserve the device-visible address prefix while allocating and
+         * indexing page tables in the inherited 36-bit DART aperture. */
+        dart->dva_base = dart->vm_base & ~GENMASK(35, 0);
         dart->vm_base &= (1LLU << 36) - 1;
+    }
 
     return dart;
 }
@@ -762,4 +767,9 @@ void dart_shutdown(dart_dev_t *dart)
 u64 dart_vm_base(dart_dev_t *dart)
 {
     return dart->vm_base;
+}
+
+u64 dart_dva_base(dart_dev_t *dart)
+{
+    return dart->dva_base;
 }
