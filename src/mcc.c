@@ -147,6 +147,7 @@ struct mcc_regs {
     int cache_ways;
     u32 cache_status_mask;
     u32 cache_status_val;
+    u32 cache_status_reg;
     u32 cache_disable;
     bool has_cache_ctrl;
 
@@ -188,11 +189,12 @@ int mcc_enable_cache(void)
        use it */
     for (int mcc = 0; mcc < mcc_count; mcc++) {
         for (int plane = 0; plane < mcc_regs[mcc].plane_count; plane++) {
+            u32 status_reg = mcc_regs[mcc].cache_status_reg ?: PLANE_CACHE_STATUS;
             plane_write32(mcc, plane, PLANE_CACHE_ENABLE, mcc_regs[mcc].cache_enable_val);
-            if (plane_poll32(mcc, plane, PLANE_CACHE_STATUS, mcc_regs[mcc].cache_status_mask,
+            if (plane_poll32(mcc, plane, status_reg, mcc_regs[mcc].cache_status_mask,
                              mcc_regs[mcc].cache_status_val, CACHE_ENABLE_TIMEOUT)) {
                 printf("MCC: timeout while enabling cache for MCC %d plane %d: 0x%x\n", mcc, plane,
-                       plane_read32(mcc, plane, PLANE_CACHE_STATUS));
+                       plane_read32(mcc, plane, status_reg));
                 ret = -1;
             } else if (mcc_regs[mcc].cache_disable) {
                 plane_write32(mcc, plane, mcc_regs[mcc].cache_disable, 0);
@@ -523,7 +525,7 @@ int mcc_init_m3(int node, int *path)
     return 0;
 }
 
-int mcc_init_t8140(int node, int *path)
+int mcc_init_adt(int node, int *path, u32 cache_enable_val)
 {
     u32 amcc_count = 1;
     u32 amcc_reg_idx = 0;
@@ -531,8 +533,9 @@ int mcc_init_t8140(int node, int *path)
     u32 plane_count = 0;
     u32 plane_stride = T8140_PLANE_STRIDE;
     int lock_node;
+    u32 status_reg = 0, status_mask = 0, status_val = 0;
 
-    printf("MCC: Initializing T8140 AMCCs...\n");
+    printf("MCC: Initializing AMCCs from ADT...\n");
 
     if (ADT_GETPROP(adt, node, "amcc-reg-idx", &amcc_reg_idx) < 0) {
         printf("MCC: Failed to get amcc-reg-idx property!\n");
@@ -561,6 +564,20 @@ int mcc_init_t8140(int node, int *path)
     if (!plane_count)
         plane_count = 4;
 
+    if (cache_enable_val) {
+        /* The old per-way counters at 0x1c04 have changed. The handoff ADT
+         * supplies the cache-ready predicate for all AMCC planes. */
+        if (lock_node < 0 ||
+            ADT_GETPROP(adt, lock_node, "cache-status-reg-offset", &status_reg) < 0 ||
+            ADT_GETPROP(adt, lock_node, "cache-status-reg-mask", &status_mask) < 0 ||
+            ADT_GETPROP(adt, lock_node, "cache-status-reg-value", &status_val) < 0 ||
+            !status_mask || (status_val & ~status_mask) || (status_reg & 3) ||
+            plane_stride < sizeof(u32) || status_reg > plane_stride - sizeof(u32)) {
+            printf("MCC: Invalid cache status description\n");
+            return -1;
+        }
+    }
+
     mcc_count = amcc_count;
     if (mcc_count > MAX_MCC_INSTANCES) {
         printf("MCC: Too many instances, increase MAX_MCC_INSTANCES!\n");
@@ -576,11 +593,15 @@ int mcc_init_t8140(int node, int *path)
         mcc_regs[i].plane_stride = plane_stride;
         mcc_regs[i].plane_count = plane_count;
         mcc_regs[i].dcs_count = dcs_count;
-        mcc_regs[i].has_cache_ctrl = false;
+        mcc_regs[i].has_cache_ctrl = !!cache_enable_val;
+        mcc_regs[i].cache_enable_val = cache_enable_val;
+        mcc_regs[i].cache_status_reg = status_reg;
+        mcc_regs[i].cache_status_mask = status_mask;
+        mcc_regs[i].cache_status_val = status_val;
         mcc_regs[i].tz = NULL;
     }
 
-    printf("MCC: Initialized T8140 AMCCs (%d instances, %d planes, %d channels)\n", mcc_count,
+    printf("MCC: Initialized AMCCs (%d instances, %d planes, %d channels)\n", mcc_count,
            mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
 
     mcc_initialized = true;
@@ -615,7 +636,9 @@ int mcc_init(void)
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
         return mcc_init_m3(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t8140")) {
-        return mcc_init_t8140(node, path);
+        return mcc_init_adt(node, path, 0);
+    } else if (adt_is_compatible(adt, node, "mcc,t8142")) {
+        return mcc_init_adt(node, path, 1);
     } else {
         printf("MCC: Unsupported version:%s\n", adt_get_property(adt, node, "compatible")->value);
         return -1;
