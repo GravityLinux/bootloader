@@ -1414,7 +1414,7 @@ static u64 dart_get_mapping(dart_dev_t *dart, const char *path, u64 paddr, size_
         return DART_PTR_ERR;
     }
 
-    return iova;
+    return iova | dart_dva_base(dart);
 }
 
 static int dt_device_set_reserved_mem(int node, const char *name, uint32_t phandle, u64 iova,

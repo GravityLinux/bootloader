@@ -67,6 +67,7 @@
 #define DART_T8110_TCR_OFF              0x1000
 #define DART_T8110_TCR_REMAP            GENMASK(11, 8)
 #define DART_T8110_TCR_REMAP_EN         BIT(7)
+#define DART_T8110_TCR_FOUR_LEVELS      BIT(3)
 #define DART_T8110_TCR_BYPASS_DAPF      BIT(2)
 #define DART_T8110_TCR_BYPASS_DART      BIT(1)
 #define DART_T8110_TCR_TRANSLATE_ENABLE BIT(0)
@@ -112,6 +113,7 @@ struct dart_params {
 struct dart_dev {
     bool locked;
     bool keep;
+    bool extended_tables;
     uintptr_t regs;
     u8 device;
     enum dart_type_t type;
@@ -237,6 +239,8 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
     }
 
     dart->keep = keep_pts;
+    dart->extended_tables = type == DART_T8110 && (dart->locked || keep_pts) &&
+                            (read32(DART_TCR(dart)) & DART_T8110_TCR_FOUR_LEVELS);
 
     if (dart->locked || keep_pts) {
         for (int i = 0; i < dart->params->ttbr_count; i++) {
@@ -245,6 +249,15 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
                 dart->l1[i] =
                     (u64 *)(FIELD_GET(dart->params->ttbr_addr, ttbr) << dart->params->ttbr_shift);
         }
+    }
+
+    /* Extended roots are inherited read-only; do not allocate or reconfigure them. */
+    if (dart->extended_tables) {
+        if (!dart->l1[0]) {
+            free(dart);
+            return NULL;
+        }
+        return dart;
     }
 
     for (int i = 0; i < dart->params->ttbr_count; i++) {
@@ -410,11 +423,21 @@ dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts)
     printf("dart: dart %s at 0x%lx is a %s%s\n", name, base, type_s,
            dart->locked ? " (locked)" : "");
 
+    int len;
+    const fdt64_t *range = fdt_getprop(dt, node, "apple,dma-range", &len);
+    if (range && len == 2 * sizeof(*range)) {
+        u64 base = fdt64_ld(range);
+        dart->vm_base = base & GENMASK(35, 0);
+        dart->dva_base = base & ~GENMASK(35, 0);
+    }
     return dart;
 }
 
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
+    if (dart->extended_tables)
+        return -1;
+
     int node = adt_path_offset(adt, path);
     if (node < 0) {
         printf("dart: Error getting DART node %s\n", path);
@@ -546,6 +569,9 @@ static int dart_map_page(dart_dev_t *dart, uintptr_t iova, uintptr_t paddr, u32 
 
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags)
 {
+    if (dart->extended_tables)
+        return -1;
+
     uintptr_t paddr = (uintptr_t)bfr;
     u64 offset = 0;
 
@@ -591,6 +617,9 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
 
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
+    if (dart->extended_tables)
+        return;
+
     if (len % SZ_16K)
         return;
     if (iova % SZ_16K)
@@ -608,6 +637,9 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
 {
+    if (dart->extended_tables)
+        return;
+
     if (iova & ((1 << 25) - 1)) {
         printf("dart: %08lx is not at the start of L2 table\n", iova);
         return;
@@ -633,42 +665,25 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
 
 static void *dart_translate_internal(dart_dev_t *dart, uintptr_t iova, int silent)
 {
-    u32 ttbr = (iova >> 36) & 0x3;
-    u32 l1_index = (iova >> 25) & 0x7ff;
-
-    if ((int)ttbr >= dart->params->ttbr_count) {
-        printf("dart[%lx %u]: ttbr out of range: %d\n", dart->regs, dart->device, ttbr);
+    u32 ttbr = dart->extended_tables ? 0 : ((iova >> 36) & 0x3);
+    if (ttbr >= (u32)dart->params->ttbr_count || !dart->l1[ttbr])
         return NULL;
+    u64 *table = dart->l1[ttbr];
+    /* T8110 FOUR_LEVELS mode adds a root above the usual two tables.
+     * Table/leaf entries retain the same format. Follow the configured mode,
+     * including address bits above 36, rather than folding every DVA. */
+    for (int level = dart->extended_tables ? 2 : 1; level >= 0; level--) {
+        u32 index = (iova >> (14 + 11 * level)) & 0x7ff;
+        u64 pte = table[index];
+        if (!(pte & DART_PTE_VALID)) {
+            if (!silent)
+                printf("dart[%lx %u]: L%d translation failure at %lx\n", dart->regs, dart->device,
+                       level, iova);
+            return NULL;
+        }
+        table = (void *)(FIELD_GET(dart->params->offset_mask, pte) << DART_PTE_OFFSET_SHIFT);
     }
-
-    if (!dart->l1[ttbr]) {
-        printf("dart[%lx %u]: l1[%u] is not set\n", dart->regs, dart->device, ttbr);
-        return NULL;
-    }
-
-    if (!(dart->l1[ttbr][l1_index] & DART_PTE_VALID)) {
-        if (!silent)
-            printf("dart[%lx %u]: l1 translation failure %x %lx\n", dart->regs, dart->device,
-                   l1_index, iova);
-        return NULL;
-    }
-
-    u32 l2_index = (iova >> 14) & 0x7ff;
-    u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, dart->l1[ttbr][l1_index])
-                      << DART_PTE_OFFSET_SHIFT);
-
-    if (!(l2[l2_index] & DART_PTE_VALID)) {
-        if (!silent)
-            printf("dart[%lx %u]: l2 translation failure %x:%x %lx\n", dart->regs, dart->device,
-                   l1_index, l2_index, iova);
-        return NULL;
-    }
-
-    u32 offset = iova & 0x3fff;
-    void *base =
-        (void *)(FIELD_GET(dart->params->offset_mask, l2[l2_index]) << DART_PTE_OFFSET_SHIFT);
-
-    return base + offset;
+    return (void *)((u64)table | (iova & (SZ_16K - 1)));
 }
 
 void *dart_translate(dart_dev_t *dart, uintptr_t iova)
@@ -683,6 +698,9 @@ void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova)
 
 u64 dart_search(dart_dev_t *dart, void *paddr)
 {
+    if (dart->extended_tables)
+        return DART_PTR_ERR;
+
     for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
         if (!dart->l1[ttbr])
             continue;
@@ -708,6 +726,9 @@ u64 dart_search(dart_dev_t *dart, void *paddr)
 
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
 {
+    if (dart->extended_tables)
+        return DART_PTR_ERR;
+
     if (len % SZ_16K)
         return -1;
     if (start < 0 || start % SZ_16K)
@@ -737,6 +758,12 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
 
 void dart_shutdown(dart_dev_t *dart)
 {
+    if (dart->extended_tables) {
+        /* These roots and all child tables belong to resident firmware. */
+        free(dart);
+        return;
+    }
+
     if (!dart->locked && !dart->keep)
         write32(DART_TCR(dart), dart->params->tcr_disabled);
 
