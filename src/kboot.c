@@ -1526,8 +1526,73 @@ static int dt_device_set_named_mem_region(const char *alias, u32 phandle, const 
     if (index < 0)
         return dt_device_add_mem_region(alias, phandle, name);
     fdt32_t value = cpu_to_fdt32(phandle);
-    return fdt_setprop_inplace_namelen_partial(dt, node, "memory-region", 13,
-                                               index * sizeof(value), &value, sizeof(value));
+    return fdt_setprop_inplace_namelen_partial(dt, node, "memory-region", 13, index * sizeof(value),
+                                               &value, sizeof(value));
+}
+
+/* Export only RAM segments still mapped by this consumer's actual DART.
+ * A second host may map different segments of the same resident firmware. */
+static int dt_reserve_mapped_asc(const char *adt_path, const char *alias, u64 excluded_base,
+                                 u64 excluded_size)
+{
+    int device = fdt_path_offset(dt, alias);
+    if (device < 0)
+        return 0;
+    int source = adt_path_offset(adt, adt_path);
+    if (source < 0)
+        return 0;
+    u32 bytes;
+    const struct adt_segment_ranges *segments = adt_getprop(adt, source, "segment-ranges", &bytes);
+    if (!segments || bytes % sizeof(*segments))
+        bail("ADT: invalid resident segment table for %s\n", alias);
+    u32 owner = fdt_get_phandle(dt, device);
+    if (!owner &&
+        (fdt_generate_phandle(dt, &owner) || fdt_setprop_u32(dt, device, "phandle", owner)))
+        return -1;
+    dart_dev_t *dart = dt_init_dart_by_node(device, 0);
+    if (!dart)
+        return -1;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
+    if (chosen >= 0)
+        ADT_GETPROP(adt, chosen, "dram-base", &dram_base);
+    int ret = 0;
+    for (size_t i = 0; i < bytes / sizeof(*segments); i++) {
+        const struct adt_segment_ranges *seg = &segments[i];
+        if (seg->phys < dram_base || !seg->size ||
+            (excluded_size && seg->phys >= excluded_base &&
+             seg->phys - excluded_base < excluded_size))
+            continue;
+        u64 iova = seg->remap;
+        u64 address = iova;
+        size_t size = ALIGN_UP(seg->size, SZ_16K);
+        bool mapped = true;
+        for (size_t offset = 0; offset < size; offset += SZ_16K) {
+            if ((u64)dart_translate_silent(dart, address + offset) != seg->phys + offset) {
+                mapped = false;
+                break;
+            }
+        }
+        if (!mapped)
+            continue;
+        char node_name[64], region_name[32];
+        snprintf(node_name, sizeof(node_name), "asc-firmware@%lx", seg->phys);
+        snprintf(region_name, sizeof(region_name), "firmware-%zu", i);
+        int mem = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, size);
+        if (mem < 0) {
+            ret = mem;
+            break;
+        }
+        u32 phandle = fdt_get_phandle(dt, mem);
+        ret = dt_device_set_reserved_mem(mem, node_name, owner, iova, size);
+        if (ret)
+            break;
+        ret = dt_device_set_named_mem_region(alias, phandle, region_name);
+        if (ret)
+            break;
+    }
+    dart_shutdown(dart);
+    return ret;
 }
 
 static int dt_set_dcp_firmware(const char *alias)
@@ -1547,6 +1612,9 @@ static int dt_set_dcp_firmware(const char *alias)
     const struct fw_version_info *compat;
 
     switch (os_firmware.version) {
+        case V27_3B1:
+            compat = &fw_versions[V27_2];
+            break;
         case V12_3_1:
         case V12_4:
             compat = &fw_versions[V12_3];
@@ -1784,8 +1852,29 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
     if (ret < 0)
         bail("ADT: failed to read /vram/reg\n");
 
-    return dt_add_reserved_regions(dcp_alias, disp_alias, NULL, "framebuffer",
-                                   disp_reserved_regions_vram, &region, 1);
+    int pool = fdt_path_offset(dt, "scanout-pool");
+    if (pool >= 0) {
+        u64 fb_size = ALIGN_UP(cur_boot_args.video.stride * cur_boot_args.video.height, SZ_16K);
+        if (!fb_size || fb_size >= region.size)
+            bail("FDT: VRAM has no room for a scanout pool\n");
+        fdt64_t reg[2] = {cpu_to_fdt64(region.paddr + fb_size),
+                          cpu_to_fdt64(region.size - fb_size)};
+        u32 phandle = fdt_get_phandle(dt, pool);
+        if (fdt_setprop(dt, pool, "reg", reg, sizeof(reg)) ||
+            fdt_setprop_string(dt, pool, "status", "okay"))
+            return -1;
+        if (dt_device_set_named_mem_region(disp_alias, phandle, "scanout-pool"))
+            return -1;
+        region.size = fb_size;
+    }
+    ret = dt_add_reserved_regions(dcp_alias, disp_alias, NULL, "framebuffer",
+                                  disp_reserved_regions_vram, &region, 1);
+    if (ret)
+        return ret;
+    int display_node = fdt_path_offset(dt, disp_alias);
+    if (display_node >= 0 && fdt_setprop_string(dt, display_node, "status", "okay"))
+        return -1;
+    return 0;
 }
 
 static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_alt,
@@ -2057,6 +2146,16 @@ static int dt_set_display(void)
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t602x,
                                            ARRAY_SIZE(disp_reserved_regions_t602x));
+        if (ret)
+            return ret;
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
+        u64 phys, size;
+        if (display_get_vram(&phys, &size))
+            return -1;
+        ret = dt_reserve_mapped_asc("/arm-io/dcp/iop-dcp-nub", "dcp", phys, size);
+        if (ret)
+            return ret;
+        ret = dt_set_dcp_firmware("dcp");
         if (ret)
             return ret;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6022")) {
