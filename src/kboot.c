@@ -1889,6 +1889,26 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
             return -1;
         if (dt_device_set_named_mem_region(disp_alias, phandle, "scanout-pool"))
             return -1;
+        if (dt_device_set_named_mem_region(dcp_alias, phandle, "scanout-pool"))
+            return -1;
+
+        /* Firmware may still access boot-time surfaces outside the active
+         * framebuffer while IOMFB starts. Preserve those translations as
+         * well as making the physical pages available for Linux scanout. */
+        const char *consumers[] = {dcp_alias, disp_alias};
+        for (size_t i = 0; i < ARRAY_SIZE(consumers); i++) {
+            int device = fdt_path_offset(dt, consumers[i]);
+            u32 owner = fdt_get_phandle(dt, device);
+            dart_dev_t *dart = dt_init_dart_by_node(device, 0);
+            if (!dart)
+                return -1;
+            pool = fdt_path_offset(dt, "scanout-pool");
+            ret = dt_device_set_reserved_mem_from_dart(
+                pool, dart, "scanout-pool", owner, region.paddr + fb_size, region.size - fb_size);
+            dart_shutdown(dart);
+            if (ret)
+                return ret;
+        }
         region.size = fb_size;
     }
     ret = dt_add_reserved_regions(dcp_alias, disp_alias, NULL, "framebuffer",
