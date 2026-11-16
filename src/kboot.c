@@ -1595,6 +1595,13 @@ static int dt_reserve_mapped_asc(const char *adt_path, const char *alias, u64 ex
     return ret;
 }
 
+static int dt_setup_aop(void)
+{
+    if (dt_reserve_mapped_asc("/arm-io/aop", "aop", 0, 0))
+        return -1;
+    return dt_reserve_mapped_asc("/arm-io/aop", "aop-secure", 0, 0);
+}
+
 static int dt_set_dcp_firmware(const char *alias)
 {
     const char *path = fdt_get_alias(dt, alias);
@@ -2996,6 +3003,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_disable_missing_devs("i2c", "i2c@", 8))
         return -1;
     if (dt_setup_sio())
+        return -1;
+    if (dt_setup_aop())
         return -1;
     if (dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base()))
         return -1;
