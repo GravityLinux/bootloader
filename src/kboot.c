@@ -1516,6 +1516,20 @@ static int dt_device_add_mem_region(const char *alias, uint32_t phandle, const c
     return 0;
 }
 
+/* Replace an optional board-DT placeholder or append a new named region. */
+static int dt_device_set_named_mem_region(const char *alias, u32 phandle, const char *name)
+{
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0)
+        return node;
+    int index = fdt_stringlist_search(dt, node, "memory-region-names", name);
+    if (index < 0)
+        return dt_device_add_mem_region(alias, phandle, name);
+    fdt32_t value = cpu_to_fdt32(phandle);
+    return fdt_setprop_inplace_namelen_partial(dt, node, "memory-region", 13,
+                                               index * sizeof(value), &value, sizeof(value));
+}
+
 static int dt_set_dcp_firmware(const char *alias)
 {
     const char *path = fdt_get_alias(dt, alias);
@@ -1828,7 +1842,12 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
         if (ret < 0)
             return ret;
 
-        ret = dt_device_add_mem_region(fdt_path, mem_phandle, NULL);
+        char name[24];
+        if (i)
+            snprintf(name, sizeof(name), "firmware-%u", i);
+        else
+            strcpy(name, "firmware");
+        ret = dt_device_set_named_mem_region(fdt_path, mem_phandle, name);
         if (ret < 0)
             return ret;
 
@@ -2292,6 +2311,9 @@ static int dt_set_isp_fwdata(void)
     const struct fw_version_info *compat;
 
     switch (os_firmware.version) {
+        case V27_3B1:
+            compat = &fw_versions[V27_2];
+            break;
         case V13_6_1:
             compat = &fw_versions[V13_5];
             break;
@@ -2338,7 +2360,11 @@ static int dt_set_isp_fwdata(void)
     if (ret < 0)
         return ret;
 
-    return 0;
+    ret = dt_device_set_named_mem_region(fdt_path, fdt_get_phandle(dt, mem_node), "heap");
+    if (ret)
+        return ret;
+    fdt_node = fdt_path_offset(dt, fdt_path);
+    return fdt_setprop_string(dt, fdt_node, "status", "okay");
 }
 
 static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix, int max_devs)
