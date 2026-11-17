@@ -1,4 +1,7 @@
 [
+    {"index": 0, "name": "CTRR_C_LWR_EL1",              "fullname": "CTRR C Lower Address (EL1)",                                   "enc": [3, 0, 11, 0, 0  ], "width": 64},
+    {"index": 0, "name": "CTRR_C_UPR_EL1",              "fullname": "CTRR C Upper Address (EL1)",                                   "enc": [3, 0, 11, 0, 1  ], "width": 64},
+    {"index": 0, "name": "CTRR_D_UPR_EL1",              "fullname": "CTRR D Upper Address (EL1)",                                   "enc": [3, 0, 11, 0, 3  ], "width": 64},
     {"index": 0, "name": "HID0_EL1",                    "fullname": "Hardware Implementation-Dependent Register 0",                 "enc": [3, 0, 15, 0, 0  ], "width": 64},
     {"index": 0, "name": "EHID0_EL1",                   "fullname": "Hardware Implementation-Dependent Register 0 (E-core)",        "enc": [3, 0, 15, 0, 1  ], "width": 64},
     {"index": 0, "name": "HID1_EL1",                    "fullname": "Hardware Implementation-Dependent Register 1",                 "enc": [3, 0, 15, 1, 0  ], "width": 64},
