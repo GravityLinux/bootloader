@@ -400,6 +400,26 @@ static int dt_set_memory(void)
         }
     }
 
+    // On t8142 a second CTRR instance covers the DeviceTree/TrustCache area below m1n1, and Linux
+    // faults the same way if it hands those pages to a secondary CPU. Only reserve it where it is
+    // known to be populated; the instance reads back zero when it is not in use.
+    if (chip_id == T8142) {
+        u64 d_lower = mrs(SYS_IMP_APL_CTRR_D_LOWER_EL1);
+        u64 d_upper = mrs(SYS_IMP_APL_CTRR_D_UPPER_EL1);
+
+        if (d_lower && d_upper >= d_lower) {
+            u64 d_start = ALIGN_DOWN(d_lower, get_page_size());
+            u64 d_end = ALIGN_UP(d_upper + SZ_4K, get_page_size());
+
+            if (d_start < dram_min || d_end <= d_start || d_end > dram_max)
+                bail("FDT: Invalid CTRR D range 0x%lx..0x%lx\n", d_start, d_end);
+
+            printf("FDT: Reserving CTRR D range 0x%lx..0x%lx\n", d_start, d_end);
+            if (fdt_add_mem_rsv(dt, d_start, d_end - d_start))
+                bail("FDT: Could not reserve CTRR D range\n");
+        }
+    }
+
     printf("FDT: DRAM at 0x%lx size 0x%lx\n", dram_base, dram_size);
     printf("FDT: Usable memory is 0x%lx..0x%lx (0x%lx)\n", dram_min, dram_max, dram_max - dram_min);
 
@@ -596,8 +616,17 @@ static int dt_set_cpus(void)
         if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF))
             goto next_cpu;
 
-        if (!smp_is_alive(cpu)) {
-            printf("FDT: CPU %d is not alive, disabling...\n", cpu);
+        /* Match DT CPU nodes to running CPUs by MPIDR, so the DT order doesn't matter */
+        int idx = -1;
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (smp_is_alive(i) && smp_get_mpidr(i) == dt_mpidr) {
+                idx = i;
+                break;
+            }
+        }
+
+        if (idx < 0) {
+            printf("FDT: CPU %d (MPIDR 0x%lx) is not alive, disabling...\n", cpu, dt_mpidr);
             pruned_phandles[pruned++] = fdt_get_phandle(dt, node);
 
             int next = fdt_next_subnode(dt, node);
@@ -615,16 +644,11 @@ static int dt_set_cpus(void)
             }
         }
 
-        u64 mpidr = smp_get_mpidr(cpu);
-
-        if (dt_mpidr != mpidr)
-            bail_cleanup("FDT: DT CPU %d MPIDR mismatch: 0x%lx != 0x%lx\n", cpu, dt_mpidr, mpidr);
-
-        u64 release_addr = smp_get_release_addr(cpu);
+        u64 release_addr = smp_get_release_addr(idx);
         if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
             bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
 
-        printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", cpu, mpidr, release_addr);
+        printf("FDT: CPU %d MPIDR=0x%lx release-addr=0x%lx\n", idx, dt_mpidr, release_addr);
 
     next_cpu:
         cpu++;
