@@ -52,6 +52,9 @@ parser.add_argument('--verbose', action='store_true',
 parser.add_argument('-C', '--cpus', default=None)
 parser.add_argument('--strip-node', action="append", default=[], metavar='SUBSTR',
                     help='Remove every ADT node whose name contains SUBSTR.')
+parser.add_argument('--disable-node', action="append", default=[], metavar='PATH',
+                    help='Keep the ADT node at PATH (others, e.g. SPTM, may need its properties) but '
+                         'prefix every compatible under it with "disabled," so no driver matches.')
 parser.add_argument('-r', '--raw', action="store_true")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-a', '--append-payload', type=pathlib.Path, action="append", default=[])
@@ -113,6 +116,15 @@ if args.strip_node:
                 strip_nodes(child, child_path)
 
     strip_nodes(hv.adt)
+
+for path in args.disable_node:
+    def disable(node, path):
+        if hasattr(node, "compatible"):
+            node.compatible = ["disabled," + c for c in node.compatible]
+            print(f"Disabled ADT node {path}: {node.compatible}")
+        for child in node:
+            disable(child, f"{path}/{child.name}")
+    disable(hv.adt[path], path)
 
 if args.debug_xnu:
     hv.adt["chosen"].debug_enabled = 1
