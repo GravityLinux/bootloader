@@ -40,8 +40,8 @@
 #define MSG_SYSLOG_LOG            5
 #define MSG_SYSLOG_LOG_INDEX      GENMASK(7, 0)
 
-#define MSG_OSLOG_INIT 0x10
-#define MSG_OSLOG_ACK  0x30
+#define MSG_OSLOG_TYPE   GENMASK(63, 56)
+#define MSG_OSLOG_NOTIFY 2
 
 #define MGMT_MSG_HELLO        1
 #define MGMT_MSG_HELLO_ACK    2
@@ -164,7 +164,10 @@ rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
     rtk->dva_base = 0;
 
     int iop_node = asc_get_iop_node(asc);
-    ADT_GETPROP(adt, iop_node, "asc-dram-mask", &rtk->dva_base);
+    /* Recent DCP handoffs put the device-visible aperture in the DART's
+     * vm-base instead of providing asc-dram-mask on the IOP nub. */
+    if (ADT_GETPROP(adt, iop_node, "asc-dram-mask", &rtk->dva_base) < 0 && dart)
+        rtk->dva_base = dart_dva_base(dart);
 
     return rtk;
 
@@ -461,6 +464,13 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
                 }
                 break;
             case RTKIT_EP_OSLOG:
+                /* Notifications must be acknowledged even without a log
+                 * consumer, or the firmware cannot complete AP quiesce. */
+                if (FIELD_GET(MSG_OSLOG_TYPE, msg->msg) == MSG_OSLOG_NOTIFY) {
+                    if (!rtkit_send(rtk, msg))
+                        return -1;
+                    break;
+                }
                 rtkit_printf("unknown oslog message %lx\n", msg->msg);
                 break;
             default:
@@ -634,7 +644,12 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     if (has_oslog && !rtkit_start_ep(rtk, RTKIT_EP_OSLOG))
         return false;
 
+    u64 deadline = timeout_calculate(USEC_PER_SEC);
     while (rtk->iop_power != RTKIT_POWER_ON) {
+        if (timeout_expired(deadline)) {
+            rtkit_printf("timed out waiting for IOP power on\n");
+            return false;
+        }
         struct rtkit_message rtk_msg;
         int ret = rtkit_recv(rtk, &rtk_msg);
         if (ret == 1)
@@ -672,7 +687,12 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
         return false;
     }
 
+    u64 deadline = timeout_calculate(USEC_PER_SEC);
     while (rtk->ap_power != RTKIT_POWER_QUIESCED) {
+        if (timeout_expired(deadline)) {
+            rtkit_printf("AP quiesce timed out (AP=%x)\n", rtk->ap_power);
+            return false;
+        }
         struct rtkit_message rtk_msg;
         int ret = rtkit_recv(rtk, &rtk_msg);
 
@@ -692,7 +712,12 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
         return false;
     }
 
+    deadline = timeout_calculate(USEC_PER_SEC);
     while (rtk->iop_power != target) {
+        if (timeout_expired(deadline)) {
+            rtkit_printf("IOP power timed out (IOP=%x target=%x)\n", rtk->iop_power, target);
+            return false;
+        }
         struct rtkit_message rtk_msg;
         int ret = rtkit_recv(rtk, &rtk_msg);
 
@@ -716,10 +741,9 @@ bool rtkit_quiesce(rtkit_dev_t *rtk)
 
 bool rtkit_sleep(rtkit_dev_t *rtk)
 {
-    int ret = rtkit_switch_power_state(rtk, RTKIT_POWER_SLEEP);
-    if (ret < 0)
-        return ret;
+    if (!rtkit_switch_power_state(rtk, RTKIT_POWER_SLEEP))
+        return false;
 
     asc_cpu_stop(rtk->asc);
-    return 0;
+    return true;
 }

@@ -8,21 +8,13 @@
 
 #include "dcp/parser.h"
 
-struct afk_rb_hdr {
-    u32 bufsz;
-    u32 unk;
-    u32 _pad1[14];
-    u32 rptr;
-    u32 _pad2[15];
-    u32 wptr;
-    u32 _pad3[15];
-};
-
 struct afk_rb {
     bool ready;
-    struct afk_rb_hdr *hdr;
+    u32 *rptr;
+    u32 *wptr;
     void *buf;
     size_t bufsz;
+    size_t block_size;
 };
 
 enum EPICType {
@@ -104,6 +96,11 @@ struct afk_epic_ep {
     struct rtkit_buffer rxbuf;
 
     bool started;
+    bool compact;
+    u8 compact_seq, compact_next_seq;
+    u16 compact_interface;
+    u32 compact_length, compact_received, compact_token;
+    void *compact_message;
     u16 seq;
 
     u32 num_channels;
@@ -124,6 +121,7 @@ enum RBEP_MSG {
     RBEP_START = 0xa3,
     RBEP_START_ACK = 0x86,
     RBEP_SEND = 0xa2,
+    RBEP_SPACE_AVAILABLE = 0xa7,
     RBEP_RECV = 0x85,
     RBEP_SHUTDOWN = 0xc0,
     RBEP_SHUTDOWN_ACK = 0xc1,
@@ -148,15 +146,32 @@ enum RBEP_MSG {
 
 bool afk_rb_init(afk_epic_ep_t *epic, struct afk_rb *rb, u64 base, u64 size)
 {
-    rb->hdr = epic->buf.bfr + base;
-
-    if (rb->hdr->bufsz + sizeof(*rb->hdr) != size) {
-        printf("AFK: ring buffer size mismatch\n");
+    if (base > epic->buf.sz || size > epic->buf.sz - base || size < 3 * (1 << BLOCK_SHIFT)) {
+        printf("AFK: ring buffer lies outside its allocation\n");
         return false;
     }
 
-    rb->buf = rb->hdr + 1;
-    rb->bufsz = rb->hdr->bufsz;
+    dma_rmb();
+    void *hdr = epic->buf.bfr + base;
+    u32 bufsz = *(u32 *)hdr;
+    if (!bufsz || bufsz >= size || (size - bufsz) % 3) {
+        printf("AFK: invalid ring buffer size\n");
+        return false;
+    }
+
+    /* As in the Python AFK client, size/rptr/wptr occupy three equal blocks.
+     * Firmware chooses their stride; it is not necessarily one 64-byte block. */
+    size_t stride = (size - bufsz) / 3;
+    if (stride % (1 << BLOCK_SHIFT) || (stride & (stride - 1))) {
+        printf("AFK: invalid ring buffer header stride\n");
+        return false;
+    }
+
+    rb->rptr = hdr + stride;
+    rb->wptr = hdr + 2 * stride;
+    rb->buf = hdr + 3 * stride;
+    rb->bufsz = bufsz;
+    rb->block_size = stride;
     rb->ready = true;
 
     return true;
@@ -243,7 +258,7 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
         case RBEP_RECV: {
             dma_rmb();
             struct afk_rb *rb = &epic->rx;
-            if (rb->hdr->rptr != rb->hdr->wptr) {
+            if (rb->ready && *rb->rptr != *rb->wptr) {
                 if (endpoint == epic->ep)
                     return EPIC_DATA_READY;
                 else if (epic->recv_handler)
@@ -251,6 +266,9 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
             }
             break;
         }
+        case RBEP_SPACE_AVAILABLE:
+            break;
+
         case RBEP_START_ACK:
             epic->started = true;
             break;
@@ -271,22 +289,23 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
 static int afk_epic_rx(afk_epic_ep_t *epic, struct afk_qe **qe)
 {
     struct afk_rb *rb = &epic->rx;
-    u32 rptr = rb->hdr->rptr;
+    u32 rptr = *rb->rptr;
     struct afk_qe *hdr = rb->buf + rptr;
 
     if (hdr->magic != QE_MAGIC) {
-        printf("EPIC: bad queue entry magic!\n");
+        printf("EPIC: bad queue entry magic 0x%x (rptr=%x wptr=%x bufsz=%lx) at %p\n", hdr->magic,
+               rptr, *rb->wptr, rb->bufsz, hdr);
         return -1;
     }
 
-    if (rptr + hdr->size > rb->bufsz) {
+    if (rptr + sizeof(*hdr) + hdr->size > rb->bufsz) {
         rptr = 0;
         hdr = rb->buf + rptr;
         if (hdr->magic != QE_MAGIC) {
             printf("EPIC: bad queue entry magic!\n");
             return -1;
         }
-        rb->hdr->rptr = rptr;
+        *rb->rptr = rptr;
     }
 
     *qe = hdr;
@@ -298,10 +317,11 @@ static int afk_epic_tx(afk_epic_ep_t *epic, u32 channel, u32 type, void *data, s
 {
     struct afk_rb *rb = &epic->tx;
 
-    u32 rptr = rb->hdr->rptr;
-    u32 wptr = rb->hdr->wptr;
+    u32 rptr = *rb->rptr;
+    u32 wptr = *rb->wptr;
+    u32 old_wptr = wptr;
     struct afk_qe *hdr = rb->buf + wptr;
-    size_t buf_advance = ALIGN_UP(sizeof(struct afk_qe) + size, 1 << BLOCK_SHIFT);
+    size_t buf_advance = ALIGN_UP(sizeof(struct afk_qe) + size, rb->block_size);
 
     if (wptr < rptr && buf_advance >= rptr - wptr)
         goto buffer_full;
@@ -327,14 +347,14 @@ static int afk_epic_tx(afk_epic_ep_t *epic, u32 channel, u32 type, void *data, s
     }
 
     wptr += size;
-    wptr = ALIGN_UP(wptr, 1 << BLOCK_SHIFT);
+    wptr = ALIGN_UP(wptr, rb->block_size);
     if (wptr >= rb->bufsz)
         wptr = 0;
 
     memcpy(hdr + 1, data, size);
 
     dma_mb();
-    rb->hdr->wptr = wptr;
+    *rb->wptr = wptr;
     dma_wmb();
 
     struct rtkit_message msg = {
@@ -342,6 +362,9 @@ static int afk_epic_tx(afk_epic_ep_t *epic, u32 channel, u32 type, void *data, s
         FIELD_PREP(RBEP_TYPE, RBEP_SEND) | FIELD_PREP(SEND_WPTR, wptr),
     };
 
+    if (epic->compact)
+        msg.msg = FIELD_PREP(RBEP_TYPE, RBEP_RECV) | ((u64)(rptr & 0xffff) << 32) |
+                  ((u64)(wptr & 0xffff) << 16) | (old_wptr & 0xffff);
     if (!rtkit_send(epic->afk->rtk, &msg)) {
         printf("EPIC: failed to send TX WPTR message\n");
         return -1;
@@ -357,7 +380,7 @@ buffer_full:
 static void afk_epic_rx_ack(afk_epic_ep_t *epic)
 {
     struct afk_rb *rb = &epic->rx;
-    u32 rptr = rb->hdr->rptr;
+    u32 rptr = *rb->rptr;
     struct afk_qe *hdr = rb->buf + rptr;
 
     if (hdr->magic != QE_MAGIC) {
@@ -366,11 +389,193 @@ static void afk_epic_rx_ack(afk_epic_ep_t *epic)
 
     dma_mb();
 
-    rptr = ALIGN_UP(rptr + sizeof(*hdr) + hdr->size, 1 << BLOCK_SHIFT);
+    rptr = ALIGN_UP(rptr + sizeof(*hdr) + hdr->size, rb->block_size);
     assert(rptr <= rb->bufsz);
     if (rptr == rb->bufsz)
         rptr = 0;
-    rb->hdr->rptr = rptr;
+    *rb->rptr = rptr;
+}
+
+/* Compact EPIC wire format and fragment limit follow Gravity Linux's clean
+ * drm/apple AFK implementation (Cody Ho, based on Sven Peter's AFK driver).
+ * The bootloader uses synchronous commands and bounds each logical message. */
+#define COMPACT_FRAGMENT_SIZE 1028
+#define COMPACT_MESSAGE_MAX   (64 * 1024)
+#define COMPACT_ANNOUNCE      0x11
+#define COMPACT_START         0x12
+
+struct compact_hdr {
+    u8 seq, flags;
+    u16 interface;
+    u32 length;
+} PACKED;
+
+struct compact_body {
+    u64 timestamp;
+    u8 type, category, unk, flags;
+    u32 reserved;
+    u8 payload[];
+} PACKED;
+
+struct compact_desc {
+    u32 token;
+    u32 length; /* Request capacity; replies may leave this zero. */
+    u8 payload[];
+} PACKED;
+
+static bool afk_is_compact(struct afk_qe *msg)
+{
+    struct compact_hdr *hdr = (void *)msg->data;
+    struct compact_body *body = (void *)(hdr + 1);
+    return !msg->channel && !msg->type && msg->size >= sizeof(*hdr) + sizeof(*body) &&
+           hdr->length >= sizeof(*body) && hdr->length <= COMPACT_MESSAGE_MAX &&
+           msg->size - sizeof(*hdr) <= hdr->length && body->category == 0 &&
+           body->type == COMPACT_ANNOUNCE;
+}
+
+/* Copy before publishing the consumer pointer, including on fragmented RX. */
+static int afk_compact_rx(afk_epic_ep_t *epic, struct afk_qe *msg)
+{
+    if (msg->channel || msg->type || msg->size <= sizeof(struct compact_hdr))
+        return -1;
+    struct compact_hdr *hdr = (void *)msg->data;
+    u32 size = msg->size - sizeof(*hdr);
+    if (hdr->length < sizeof(struct compact_body) || hdr->length > COMPACT_MESSAGE_MAX ||
+        size > hdr->length)
+        return -1;
+
+    if (!epic->compact_received) {
+        free(epic->compact_message);
+        epic->compact_message = malloc(hdr->length);
+        if (!epic->compact_message)
+            return -1;
+        epic->compact_length = hdr->length;
+        epic->compact_interface = hdr->interface;
+    } else if (hdr->length != epic->compact_length || hdr->interface != epic->compact_interface ||
+               hdr->seq != epic->compact_next_seq) {
+        return -1;
+    }
+    if (size > epic->compact_length - epic->compact_received)
+        return -1;
+    memcpy(epic->compact_message + epic->compact_received, hdr + 1, size);
+    epic->compact_received += size;
+    epic->compact_next_seq = hdr->seq + 1;
+    afk_epic_rx_ack(epic);
+    if (epic->compact_received != epic->compact_length)
+        return 0;
+    epic->compact_received = 0;
+    return 1;
+}
+
+static int afk_compact_send(afk_epic_ep_t *epic, u16 interface, u8 type, u8 category, void *payload,
+                            size_t payload_size)
+{
+    size_t total = sizeof(struct compact_body) + payload_size;
+    if (total > COMPACT_MESSAGE_MAX)
+        return -1;
+    struct compact_body *body = calloc(1, total);
+    if (!body)
+        return -1;
+    body->type = type;
+    body->category = category;
+    body->unk = type == COMPACT_START;
+    if (payload_size)
+        memcpy(body->payload, payload, payload_size);
+
+    int ret = 0;
+    u64 deadline = timeout_calculate(5 * USEC_PER_SEC);
+    for (size_t offset = 0; offset < total;) {
+        size_t chunk = min(total - offset, COMPACT_FRAGMENT_SIZE);
+        u8 fragment[sizeof(struct compact_hdr) + COMPACT_FRAGMENT_SIZE];
+        struct compact_hdr *hdr = (void *)fragment;
+        *hdr = (struct compact_hdr){
+            .seq = epic->compact_seq++, .interface = interface, .length = total};
+        memcpy(hdr + 1, (void *)body + offset, chunk);
+        struct afk_rb *rb = &epic->tx;
+        size_t advance = ALIGN_UP(sizeof(struct afk_qe) + sizeof(*hdr) + chunk, rb->block_size);
+        while (true) {
+            dma_rmb();
+            u32 rptr = *rb->rptr, wptr = *rb->wptr;
+            bool fits =
+                wptr < rptr
+                    ? advance < rptr - wptr
+                    : ((advance < rb->bufsz - wptr || (advance == rb->bufsz - wptr && rptr)) ||
+                       advance < rptr);
+            if (fits)
+                break;
+            if (timeout_expired(deadline)) {
+                ret = -1;
+                goto out;
+            }
+            /* Service mailbox progress without consuming an eventual reply. */
+            if (afk_epic_work(epic->afk, epic->ep) < 0) {
+                ret = -1;
+                goto out;
+            }
+            udelay(10);
+        }
+        ret = afk_epic_tx(epic, 0, 0, fragment, sizeof(*hdr) + chunk);
+        if (ret < 0)
+            goto out;
+        offset += chunk;
+    }
+    ret = 0;
+out:
+    free(body);
+    return ret;
+}
+
+static int afk_compact_command(afk_epic_ep_t *epic, u16 interface, u8 type, void *txbuf,
+                               size_t txsize, void *rxbuf, size_t *rxsize)
+{
+    size_t wire_size = max(txsize, rxsize ? *rxsize : 0);
+    if (wire_size > COMPACT_MESSAGE_MAX - sizeof(struct compact_body) - sizeof(struct compact_desc))
+        return -1;
+    struct compact_desc *desc = calloc(1, sizeof(*desc) + wire_size);
+    if (!desc)
+        return -1;
+    u32 token = epic->compact_token++ << 8;
+    desc->token = token;
+    desc->length = wire_size;
+    memcpy(desc->payload, txbuf, txsize);
+    int ret = afk_compact_send(epic, interface, type, 1, desc, sizeof(*desc) + wire_size);
+    free(desc);
+    if (ret < 0)
+        return ret;
+
+    u64 deadline = timeout_calculate(5 * USEC_PER_SEC);
+    while (!timeout_expired(deadline)) {
+        ret = afk_epic_work(epic->afk, epic->ep);
+        if (ret < 0)
+            return ret;
+        if (ret != EPIC_DATA_READY)
+            continue;
+        struct afk_qe *msg;
+        if (afk_epic_rx(epic, &msg) < 0)
+            return -1;
+        ret = afk_compact_rx(epic, msg);
+        if (ret < 0)
+            return ret;
+        if (!ret)
+            continue;
+        struct compact_body *body = epic->compact_message;
+        if (body->category != 2 || body->type != type || epic->compact_interface != interface)
+            continue;
+        size_t payload_size = epic->compact_length - sizeof(*body);
+        if (payload_size < sizeof(struct compact_desc))
+            return -1;
+        struct compact_desc *reply = (void *)body->payload;
+        if (reply->token != token)
+            continue;
+        size_t available = payload_size - sizeof(*reply);
+        if (rxsize) {
+            *rxsize = min(*rxsize, available);
+            memcpy(rxbuf, reply->payload, *rxsize);
+        }
+        return 0;
+    }
+    printf("AFK: compact command timed out\n");
+    return -1;
 }
 
 int afk_epic_work(afk_epic_t *afk, int endpoint)
@@ -381,7 +586,7 @@ int afk_epic_work(afk_epic_t *afk, int endpoint)
         afk_epic_ep_t *cur = afk->endpoint[i++];
         if (cur) {
             struct afk_rb *rb = &cur->rx;
-            if (rb->hdr->rptr != rb->hdr->wptr) {
+            if (rb->ready && *rb->rptr != *rb->wptr) {
                 if (cur->ep == endpoint) {
                     return EPIC_DATA_READY;
                 }
@@ -496,6 +701,9 @@ static int afk_epic_handle_std_service(afk_epic_ep_t *epic, int channel, u8 cate
 int afk_epic_command(afk_epic_ep_t *epic, int channel, u16 sub_type, void *txbuf, size_t txsize,
                      void *rxbuf, size_t *rxsize)
 {
+    if (epic->compact)
+        return afk_compact_command(epic, channel, sub_type, txbuf, txsize, rxbuf, rxsize);
+
     struct {
         struct epic_hdr hdr;
         struct epic_sub_hdr sub;
@@ -681,6 +889,7 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
 
     epic->afk->endpoint[epic->ep - 0x20] = NULL;
 
+    free(epic->compact_message);
     free(epic);
     return 0;
 }
@@ -738,6 +947,39 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
         ret = afk_epic_rx(epic, &msg);
         if (ret < 0)
             return ret;
+
+        if (epic->compact || afk_is_compact(msg)) {
+            epic->compact = true;
+            ret = afk_compact_rx(epic, msg);
+            if (ret < 0)
+                return ret;
+            if (!ret)
+                continue;
+            struct compact_body *body = epic->compact_message;
+            if (body->category || body->type != COMPACT_ANNOUNCE ||
+                epic->compact_length < sizeof(*body) + 32)
+                continue;
+            char name[33];
+            memcpy(name, body->payload, 32);
+            name[32] = 0;
+            const afk_epic_service_ops_t *ops = afk_match_service(epic, name);
+            if (!ops || epic->num_channels >= AFK_MAX_CHANNEL)
+                continue;
+            afk_epic_service_t *service = &epic->services[epic->num_channels++];
+            service->enabled = true;
+            service->ops = ops;
+            service->intf = intf;
+            service->epic = epic;
+            service->channel = epic->compact_interface;
+            ops->init(service, name, name, -1);
+            if (afk_compact_send(epic, service->channel, COMPACT_START, 0, NULL, 0) < 0)
+                return -1;
+            printf("AFK[ep:%02x]: compact service %s on interface %u\n", epic->ep, name,
+                   service->channel);
+            if (++services >= expected)
+                break;
+            continue;
+        }
 
         if (msg->type != TYPE_NOTIFY && msg->type != TYPE_REPLY) {
             dprintf("AFK[ep:%02x]: got unexpected message type %d during iface start\n", epic->ep,
@@ -821,6 +1063,9 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
         printf("AFK[ep:%02x]: too many unexpected messages, giving up\n", epic->ep);
         return -1;
     }
+
+    if (epic->compact)
+        return 0;
 
     if (!rtkit_alloc_buffer(epic->afk->rtk, &epic->rxbuf, rxsize)) {
         printf("AFK[ep:%02x]: failed to allocate rx buffer\n", epic->ep);

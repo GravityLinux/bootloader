@@ -23,6 +23,28 @@
 #define ISP_PMGR_T6020 0x4008
 #define ISP_PMGR_T6031 0x4030
 
+/* Firmware owns these ISP power domains at handoff. Reserve its host heap
+ * without probing or resetting the processor; Linux takes power ownership. */
+struct isp_heap_layout {
+    u32 chip;
+    enum fw_version firmware;
+    u64 shared_base;
+};
+
+static const struct isp_heap_layout isp_heap_layouts[] = {
+    {T8142, V27_2, 0x1700000},
+    {T8142, V27_3B1, 0x1700000},
+};
+
+static const struct isp_heap_layout *isp_find_heap_layout(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(isp_heap_layouts); i++)
+        if (isp_heap_layouts[i].chip == chip_id &&
+            isp_heap_layouts[i].firmware == os_firmware.version)
+            return &isp_heap_layouts[i];
+    return NULL;
+}
+
 static bool isp_initialized = false;
 static u64 heap_phys, heap_iova, heap_size, heap_top;
 
@@ -39,6 +61,14 @@ int isp_get_heap(u64 *phys, u64 *iova, u64 *size)
 
 u64 isp_iova_base(void)
 {
+    /* New handoffs describe the device-visible aperture on the DART. */
+    int node = adt_path_offset(adt, "/arm-io/dart-isp");
+    if (node < 0)
+        node = adt_path_offset(adt, "/arm-io/dart-isp0");
+    u64 base;
+    if (node >= 0 && ADT_GETPROP(adt, node, "vm-base", &base) == sizeof(base))
+        return base;
+
     switch (chip_id) {
         case 0x6020 ... 0x6fff:
         case 0x8122:
@@ -51,7 +81,10 @@ u64 isp_iova_base(void)
 
 int isp_init(void)
 {
+    if (isp_initialized)
+        return 0;
     int err = 0;
+    bool power_enabled = false;
 
     const char *isp_path = "/arm-io/isp";
     const char *dart_path = "/arm-io/dart-isp";
@@ -68,6 +101,12 @@ int isp_init(void)
     if (node < 0)
         return 0;
 
+    const struct isp_heap_layout *layout = isp_find_heap_layout();
+    if (layout) {
+        heap_top = layout->shared_base;
+        goto setup_heap;
+    }
+
     /*
      * T8132 (M4) has the M4 Max's H16 ISP and runs the same macOS 26.6.2
      * firmware, whose shared allocations start at 32 MiB (the M4 Max value);
@@ -82,6 +121,8 @@ int isp_init(void)
 
     if (pmgr_adt_power_enable(isp_path) < 0)
         return -1;
+
+    power_enabled = true;
 
     u64 isp_base;
     u64 pmgr_base;
@@ -194,7 +235,12 @@ setup_heap:;
     }
     unsigned int count = segments_len / sizeof(*seg);
 
-    heap_iova = seg[count - 1].iova + seg[count - 1].size;
+    heap_iova = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        if (seg[i].iova == UINT64_MAX || seg[i].size > UINT64_MAX - seg[i].iova)
+            continue;
+        heap_iova = max(heap_iova, seg[i].iova + seg[i].size);
+    }
     if (heap_iova >= heap_top) {
         printf("isp: firmware segments end above the heap top\n");
         return -1;
@@ -210,7 +256,7 @@ setup_heap:;
 
     isp_initialized = true;
 
-    if (chip_id != T8132)
+    if (power_enabled)
         pmgr_adt_power_disable(isp_path);
     return err;
 }

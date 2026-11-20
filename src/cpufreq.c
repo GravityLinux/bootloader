@@ -34,6 +34,7 @@ struct cluster_t {
     bool pcluster;
     uint32_t apsc_pstate;
     uint32_t default_pstate;
+    int (*init)(const struct cluster_t *cluster);
 };
 
 struct feat_t {
@@ -72,6 +73,7 @@ static u32 pstate_reg_to_pstate(u64 val)
         case T6034:
         case T8122:
         case T8132:
+        case T8142:
             return FIELD_GET(CLUSTER_PSTATE_DESIRED1, val);
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
@@ -385,6 +387,32 @@ static struct cluster_t t8132_clusters[] = {
     {},
 };
 
+/* Modern request interface: serialize against the previous request, then
+ * leave completion asynchronous, as in the Linux T8112 cpufreq driver. */
+static int cpufreq_init_request(const struct cluster_t *cluster)
+{
+    u64 command = cluster->base + CLUSTER_PSTATE;
+    if (poll64(command, CLUSTER_PSTATE_BUSY, 0, CLUSTER_SWITCH_TIMEOUT) < 0) {
+        printf("cpufreq: Timed out waiting for cluster %s request\n", cluster->name);
+        return -1;
+    }
+    mask64(command, CLUSTER_PSTATE_DESIRED1,
+           CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, cluster->default_pstate));
+    printf("cpufreq: %s initialized at P%u\n", cluster->name, cluster->default_pstate);
+    return 0;
+}
+
+/* No legacy APSC/throttle feature is advertised on this platform. */
+static const struct cluster_t t8142_clusters[] = {
+    {.name = "ECPU", .base = 0x210e00000, .default_pstate = 5, .init = cpufreq_init_request},
+    {.name = "PCPU",
+     .base = 0x211e00000,
+     .pcluster = true,
+     .default_pstate = 6,
+     .init = cpufreq_init_request},
+    {},
+};
+
 static const struct cluster_t *cpufreq_get_t8132_clusters(void)
 {
     int cpus = adt_path_offset(adt, "/cpus");
@@ -480,6 +508,8 @@ const struct cluster_t *cpufreq_get_clusters(void)
             return t6031_clusters;
         case T8132:
             return cpufreq_get_t8132_clusters();
+        case T8142:
+            return t8142_clusters;
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
             return NULL;
@@ -568,6 +598,10 @@ static const struct feat_t t8132_features[] = {
     {},
 };
 
+static const struct feat_t t8142_features[] = {
+    {},
+};
+
 const struct feat_t *cpufreq_get_features(void)
 {
     switch (chip_id) {
@@ -604,6 +638,8 @@ const struct feat_t *cpufreq_get_features(void)
             return t6030_features;
         case T8132:
             return t8132_features;
+        case T8142:
+            return t8142_features;
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
             return NULL;
@@ -626,7 +662,8 @@ int cpufreq_init(void)
 
     bool err = false;
     while (cluster->base) {
-        err |= cpufreq_init_cluster(cluster++, features);
+        err |= cluster->init ? cluster->init(cluster) : cpufreq_init_cluster(cluster, features);
+        cluster++;
     }
 
     return err ? -1 : 0;

@@ -1021,6 +1021,9 @@ static int dt_set_wifi(void)
 {
     int anode = adt_path_offset(adt, "/arm-io/wlan");
 
+    if (anode < 0)
+        anode = adt_path_offset(adt, "/arm-io/centauri");
+
     if (anode < 0) {
         /*
          * t8012-based system does not have wifi, and on some other
@@ -1042,21 +1045,35 @@ static int dt_set_wifi(void)
     if (node < 0)
         return 0;
 
-    char antenna[8];
-    memcpy(antenna, &info[8], sizeof(antenna));
+    char antenna[9] = {0};
+    memcpy(antenna, &info[8], 8);
     fdt_setprop_string(dt, node, "apple,antenna-sku", antenna);
 
     u32 len;
     const u8 *cal_blob = adt_getprop(adt, anode, "wifi-calibration-msf", &len);
 
     if (!cal_blob || !len) {
-        printf("ADT: Failed to get wifi-calibration-msf. Replaced module?\n");
         return 0;
     }
 
     fdt_setprop(dt, node, "brcm,cal-blob", cal_blob, len);
 
     return 0;
+}
+
+/* The control function consumes the host's manifest identity; Linux owns
+ * firmware loading, endpoint reset, DMA state and radio initialization. */
+static int dt_set_centauri(void)
+{
+    int node = fdt_path_offset(dt, "wifi-control");
+    if (node < 0 || adt_path_offset(adt, "/arm-io/centauri") < 0)
+        return 0;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u32 board, chip;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "board-id", &board) < 0 ||
+        ADT_GETPROP(adt, chosen, "chip-id", &chip) < 0 || board > UINT16_MAX || chip > UINT16_MAX)
+        bail("ADT: invalid host identity for Centauri\n");
+    return fdt_setprop_u32(dt, node, "apple,host-platform-id", (board << 16) | chip);
 }
 
 static void dt_set_uboot_dm_preloc(int node)
@@ -1414,7 +1431,7 @@ static u64 dart_get_mapping(dart_dev_t *dart, const char *path, u64 paddr, size_
         return DART_PTR_ERR;
     }
 
-    return iova;
+    return iova | dart_dva_base(dart);
 }
 
 static int dt_device_set_reserved_mem(int node, const char *name, uint32_t phandle, u64 iova,
@@ -1514,6 +1531,92 @@ static int dt_device_add_mem_region(const char *alias, uint32_t phandle, const c
         bail("FDT: failed to append to 'memory-region-names' property\n");
 
     return 0;
+}
+
+/* Replace an optional board-DT placeholder or append a new named region. */
+static int dt_device_set_named_mem_region(const char *alias, u32 phandle, const char *name)
+{
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0)
+        return node;
+    int index = fdt_stringlist_search(dt, node, "memory-region-names", name);
+    if (index < 0)
+        return dt_device_add_mem_region(alias, phandle, name);
+    fdt32_t value = cpu_to_fdt32(phandle);
+    return fdt_setprop_inplace_namelen_partial(dt, node, "memory-region", 13, index * sizeof(value),
+                                               &value, sizeof(value));
+}
+
+/* Export only RAM segments still mapped by this consumer's actual DART.
+ * A second host may map different segments of the same resident firmware. */
+static int dt_reserve_mapped_asc(const char *adt_path, const char *alias, u64 excluded_base,
+                                 u64 excluded_size)
+{
+    int device = fdt_path_offset(dt, alias);
+    if (device < 0)
+        return 0;
+    int source = adt_path_offset(adt, adt_path);
+    if (source < 0)
+        return 0;
+    u32 bytes;
+    const struct adt_segment_ranges *segments = adt_getprop(adt, source, "segment-ranges", &bytes);
+    if (!segments || bytes % sizeof(*segments))
+        bail("ADT: invalid resident segment table for %s\n", alias);
+    u32 owner = fdt_get_phandle(dt, device);
+    if (!owner &&
+        (fdt_generate_phandle(dt, &owner) || fdt_setprop_u32(dt, device, "phandle", owner)))
+        return -1;
+    dart_dev_t *dart = dt_init_dart_by_node(device, 0);
+    if (!dart)
+        return -1;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
+    if (chosen >= 0)
+        ADT_GETPROP(adt, chosen, "dram-base", &dram_base);
+    int ret = 0;
+    for (size_t i = 0; i < bytes / sizeof(*segments); i++) {
+        const struct adt_segment_ranges *seg = &segments[i];
+        if (seg->phys < dram_base || !seg->size ||
+            (excluded_size && seg->phys >= excluded_base &&
+             seg->phys - excluded_base < excluded_size))
+            continue;
+        u64 iova = seg->remap;
+        u64 address = iova;
+        size_t size = ALIGN_UP(seg->size, SZ_16K);
+        bool mapped = true;
+        for (size_t offset = 0; offset < size; offset += SZ_16K) {
+            if ((u64)dart_translate_silent(dart, address + offset) != seg->phys + offset) {
+                mapped = false;
+                break;
+            }
+        }
+        if (!mapped)
+            continue;
+        char node_name[64], region_name[32];
+        snprintf(node_name, sizeof(node_name), "asc-firmware@%lx", seg->phys);
+        snprintf(region_name, sizeof(region_name), "firmware-%zu", i);
+        int mem = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, size);
+        if (mem < 0) {
+            ret = mem;
+            break;
+        }
+        u32 phandle = fdt_get_phandle(dt, mem);
+        ret = dt_device_set_reserved_mem(mem, node_name, owner, iova, size);
+        if (ret)
+            break;
+        ret = dt_device_set_named_mem_region(alias, phandle, region_name);
+        if (ret)
+            break;
+    }
+    dart_shutdown(dart);
+    return ret;
+}
+
+static int dt_setup_aop(void)
+{
+    if (dt_reserve_mapped_asc("/arm-io/aop", "aop", 0, 0))
+        return -1;
+    return dt_reserve_mapped_asc("/arm-io/aop", "aop-secure", 0, 0);
 }
 
 static int dt_set_dcp_firmware(const char *alias)
@@ -1770,8 +1873,49 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
     if (ret < 0)
         bail("ADT: failed to read /vram/reg\n");
 
-    return dt_add_reserved_regions(dcp_alias, disp_alias, NULL, "framebuffer",
-                                   disp_reserved_regions_vram, &region, 1);
+    int pool = fdt_path_offset(dt, "scanout-pool");
+    if (pool >= 0) {
+        u64 fb_size = ALIGN_UP(cur_boot_args.video.stride * cur_boot_args.video.height, SZ_16K);
+        if (!fb_size || fb_size >= region.size)
+            bail("FDT: VRAM has no room for a scanout pool\n");
+        fdt64_t reg[2] = {cpu_to_fdt64(region.paddr + fb_size),
+                          cpu_to_fdt64(region.size - fb_size)};
+        u32 phandle = fdt_get_phandle(dt, pool);
+        if (fdt_setprop(dt, pool, "reg", reg, sizeof(reg)) ||
+            fdt_setprop_string(dt, pool, "status", "okay"))
+            return -1;
+        if (dt_device_set_named_mem_region(disp_alias, phandle, "scanout-pool"))
+            return -1;
+        if (dt_device_set_named_mem_region(dcp_alias, phandle, "scanout-pool"))
+            return -1;
+
+        /* Firmware may still access boot-time surfaces outside the active
+         * framebuffer while IOMFB starts. Preserve those translations as
+         * well as making the physical pages available for Linux scanout. */
+        const char *consumers[] = {dcp_alias, disp_alias};
+        for (size_t i = 0; i < ARRAY_SIZE(consumers); i++) {
+            int device = fdt_path_offset(dt, consumers[i]);
+            u32 owner = fdt_get_phandle(dt, device);
+            dart_dev_t *dart = dt_init_dart_by_node(device, 0);
+            if (!dart)
+                return -1;
+            pool = fdt_path_offset(dt, "scanout-pool");
+            ret = dt_device_set_reserved_mem_from_dart(
+                pool, dart, "scanout-pool", owner, region.paddr + fb_size, region.size - fb_size);
+            dart_shutdown(dart);
+            if (ret)
+                return ret;
+        }
+        region.size = fb_size;
+    }
+    ret = dt_add_reserved_regions(dcp_alias, disp_alias, NULL, "framebuffer",
+                                  disp_reserved_regions_vram, &region, 1);
+    if (ret)
+        return ret;
+    int display_node = fdt_path_offset(dt, disp_alias);
+    if (display_node >= 0 && fdt_setprop_string(dt, display_node, "status", "okay"))
+        return -1;
+    return 0;
 }
 
 static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_alt,
@@ -1831,7 +1975,12 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
                 return ret;
         }
 
-        ret = dt_device_add_mem_region(fdt_path, mem_phandle, NULL);
+        char name[24];
+        if (i)
+            snprintf(name, sizeof(name), "firmware-%u", i);
+        else
+            strcpy(name, "firmware");
+        ret = dt_device_set_named_mem_region(fdt_path, mem_phandle, name);
         if (ret < 0)
             return ret;
 
@@ -2015,6 +2164,16 @@ static int dt_set_display(void)
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t602x,
                                            ARRAY_SIZE(disp_reserved_regions_t602x));
+        if (ret)
+            return ret;
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
+        u64 phys, size;
+        if (display_get_vram(&phys, &size))
+            return -1;
+        ret = dt_reserve_mapped_asc("/arm-io/dcp/iop-dcp-nub", "dcp", phys, size);
+        if (ret)
+            return ret;
+        ret = dt_set_dcp_firmware("dcp");
         if (ret)
             return ret;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6022")) {
@@ -2269,6 +2428,9 @@ static int dt_set_isp_fwdata(void)
     const struct fw_version_info *compat;
 
     switch (os_firmware.version) {
+        case V27_3B1:
+            compat = &fw_versions[V27_2];
+            break;
         case V13_6_1:
             compat = &fw_versions[V13_5];
             break;
@@ -2315,7 +2477,11 @@ static int dt_set_isp_fwdata(void)
     if (ret < 0)
         return ret;
 
-    return 0;
+    ret = dt_device_set_named_mem_region(fdt_path, fdt_get_phandle(dt, mem_node), "heap");
+    if (ret)
+        return ret;
+    fdt_node = fdt_path_offset(dt, fdt_path);
+    return fdt_setprop_string(dt, fdt_node, "status", "okay");
 }
 
 static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix, int max_devs)
@@ -2819,6 +2985,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_wifi())
         return -1;
+    if (dt_set_centauri())
+        return -1;
     if (dt_set_bluetooth())
         return -1;
     if (dt_set_uboot())
@@ -2848,6 +3016,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_disable_missing_devs("i2c", "i2c@", 8))
         return -1;
     if (dt_setup_sio())
+        return -1;
+    if (dt_setup_aop())
         return -1;
     if (dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base()))
         return -1;
